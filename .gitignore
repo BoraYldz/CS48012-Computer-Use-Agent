@@ -1,0 +1,31 @@
+# Secrets: never commit
+.env
+*.env
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Agent run logs (commit curated results to results/ instead)
+host/runs/
+*.log
+
+# VM images and snapshots
+*.iso
+*.vdi
+*.vmdk
+*.vhd
+*.vhdx
+*.sav
+*.ova
+*.ovf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
