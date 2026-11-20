@@ -1,0 +1,9 @@
+# Secrets: never commit
+.env
+.venv/
+__pycache__/
+# Run logs and screenshots of whatever was on screen
+outputs/
+# Learned lessons can quote screen text from private sessions; share them deliberately
+memory/
+.backup/
