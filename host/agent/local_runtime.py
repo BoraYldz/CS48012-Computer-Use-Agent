@@ -15,6 +15,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
+from . import sheet_tools
 from .tool_output import serialize_tool_result
 
 
@@ -113,8 +114,13 @@ class LocalVM:
             "read_text": self.read_text,
             "write_text": self.write_text,
             "read_pdf_text": self.read_pdf_text,
+            "xlsx_info": self.xlsx_info,
             "xlsx_read": self.xlsx_read,
+            "xlsx_query": self.xlsx_query,
+            "xlsx_aggregate": self.xlsx_aggregate,
             "xlsx_write": self.xlsx_write,
+            "xlsx_append_rows": self.xlsx_append_rows,
+            "xlsx_set_cells": self.xlsx_set_cells,
             # Harness-only tools: intentionally absent from WORKER_TOOLS.
             "harness_put_file": self.harness_put_file,
             "harness_get_file": self.harness_get_file,
@@ -321,27 +327,29 @@ class LocalVM:
         reader = PdfReader(self._p(path))
         return "\n".join(page.extract_text() or "" for page in reader.pages)[:max_chars]
 
-    # ---------- worker tools: spreadsheets ----------
-    def xlsx_read(self, path: str, sheet: str | None = None, max_rows: int = 500) -> dict:
-        """Read an XLSX sheet as rows of values, including truncation metadata."""
-        from openpyxl import load_workbook
+    # ---------- worker tools: spreadsheets (engine: agent/sheet_tools.py) ----------
+    def xlsx_info(self, path: str) -> dict:
+        """Overview of a workbook: every sheet with its used rows, column count and header row. Call this first."""
+        return sheet_tools.info(self._existing_xlsx(path))
 
-        workbook = load_workbook(self._p(path), data_only=True, read_only=True)
-        try:
-            if sheet and sheet not in workbook.sheetnames:
-                raise KeyError(f"worksheet not found: {sheet}")
-            worksheet = workbook[sheet] if sheet else workbook.active
-            total_rows = worksheet.max_row or 0
-            rows = [list(row) for row in worksheet.iter_rows(values_only=True, max_row=max_rows)]
-            return {
-                "sheets": workbook.sheetnames,
-                "sheet": worksheet.title,
-                "rows": rows,
-                "total_rows": total_rows,
-                "truncated": total_rows > max_rows,
-            }
-        finally:
-            workbook.close()
+    def xlsx_read(self, path: str, sheet: str | None = None, cell_range: str | None = None,
+                  max_rows: int = 100, formulas: bool = False) -> dict:
+        """Read cells as rows of COMPUTED values (formulas are evaluated). Optional cell_range like "A1:D20";
+        formulas=true returns the formula text instead. At most max_rows rows; check `truncated`."""
+        return sheet_tools.read(self._existing_xlsx(path), sheet, cell_range, max_rows, formulas)
+
+    def xlsx_query(self, path: str, sheet: str | None = None, where: list[dict] | None = None,
+                   order_by: str | None = None, descending: bool = False,
+                   columns: list[str] | None = None, limit: int = 50) -> dict:
+        """Filter/sort/select rows of a table whose header is row 1. where=[{"column":"Amount","op":">","value":100}]
+        (ops: == != > >= < <= contains). Use this instead of sorting or filtering by hand."""
+        return sheet_tools.query(self._existing_xlsx(path), sheet, where, order_by, descending, columns, limit)
+
+    def xlsx_aggregate(self, path: str, sheet: str | None = None, column: str | None = None, op: str = "sum",
+                       where: list[dict] | None = None, group_by: str | None = None) -> dict:
+        """Exact sum/avg/min/max/count of a column (header = row 1), optionally filtered (same where as
+        xlsx_query) or grouped. Use this instead of adding numbers yourself."""
+        return sheet_tools.aggregate(self._existing_xlsx(path), sheet, column, op, where, group_by)
 
     def xlsx_write(
         self,
@@ -350,26 +358,30 @@ class LocalVM:
         sheet: str = "Sheet1",
         replace_sheet: bool = True,
     ) -> str:
-        """Write rows to an XLSX worksheet; preserve other worksheets."""
-        from openpyxl import Workbook, load_workbook
-
+        """Create a workbook or a sheet from rows (list of lists; strings starting with '=' become formulas).
+        If the sheet already has data, replace_sheet=true DESTROYS it and needs human approval;
+        to add to existing data use xlsx_append_rows or xlsx_set_cells instead. Other sheets are kept."""
         p = self._p(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if p.exists():
-            workbook = load_workbook(p)
-            if sheet in workbook.sheetnames and replace_sheet:
-                del workbook[sheet]
-            worksheet = workbook[sheet] if sheet in workbook.sheetnames else workbook.create_sheet(sheet)
-        else:
-            workbook = Workbook()
-            worksheet = workbook.active
-            worksheet.title = sheet
+        existing = sheet_tools.sheet_has_data(p, sheet)
+        if existing and replace_sheet:
+            self._require_approval(
+                "xlsx_write", {"path": path, "sheet": sheet, "replace_sheet": True},
+                f"REPLACE sheet '{sheet}' in {path}: its {existing} existing row(s) will be destroyed")
+        return sheet_tools.write(p, rows, sheet, replace_sheet)
 
-        for row in rows:
-            worksheet.append(row)
-        workbook.save(p)
-        workbook.close()
-        return f"wrote {len(rows)} rows to {p.name}!{sheet}"
+    def xlsx_append_rows(self, path: str, sheet: str, rows: list[list]) -> str:
+        """Append rows below the last used row of an existing sheet. Existing cells are never changed."""
+        return sheet_tools.append_rows(self._p(path), sheet, rows)
+
+    def xlsx_set_cells(self, path: str, sheet: str, cells: dict[str, Any]) -> str:
+        """Set specific cells, e.g. {"B3": 99, "D2": "=B2*C2"}. Returns each cell's old -> new value."""
+        return sheet_tools.set_cells(self._p(path), sheet, cells)
+
+    def _existing_xlsx(self, path: str) -> Path:
+        p = self._p(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"workbook does not exist: {path}")
+        return p
 
     # ---------- harness-only tools: never exposed to workers ----------
     def harness_put_file(self, path: str, b64: str) -> str:

@@ -24,6 +24,8 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import sheet_tools  # sits next to this file in the VM; copy of host/agent/sheet_tools.py
+
 # Every path the agent touches must live under ROOT (the agent user's home by default).
 ROOT = Path(os.environ.get("AGENT_ROOT", Path.home())).resolve()
 PORT = int(os.environ.get("AGENT_PORT", "8765"))
@@ -185,38 +187,63 @@ def read_pdf_text(path: str, max_chars: int = 20000) -> str:
     return "\n".join((pg.extract_text() or "") for pg in PdfReader(_p(path)).pages)[:max_chars]
 
 
-# ---------- spreadsheets ----------
+# ---------- spreadsheets (engine shared with the host: sheet_tools.py, keep byte-identical) ----------
+def _xlsx(path: str) -> Path:
+    p = _p(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"workbook does not exist: {path}")
+    return p
+
+
 @mcp.tool()
-def xlsx_read(path: str, sheet: str | None = None, max_rows: int = 500) -> str:
-    """Read an .xlsx sheet as rows of values. Returns sheet names too."""
-    from openpyxl import load_workbook
-    wb = load_workbook(_p(path), data_only=True)
-    ws = wb[sheet] if sheet else wb.active
-    total_rows = ws.max_row
-    rows = [list(r) for r in ws.iter_rows(values_only=True, max_row=max_rows)]
-    return _json_text({"sheets": wb.sheetnames, "sheet": ws.title, "rows": rows,
-                       "total_rows": total_rows, "truncated": total_rows > max_rows})
+def xlsx_info(path: str) -> str:
+    """Overview of a workbook: every sheet with its used rows, column count and header row. Call this first."""
+    return _json_text(sheet_tools.info(_xlsx(path)))
+
+
+@mcp.tool()
+def xlsx_read(path: str, sheet: str | None = None, cell_range: str | None = None,
+              max_rows: int = 100, formulas: bool = False) -> str:
+    """Read cells as rows of COMPUTED values (formulas are evaluated). Optional cell_range like "A1:D20";
+    formulas=true returns the formula text instead. At most max_rows rows; check `truncated`."""
+    return _json_text(sheet_tools.read(_xlsx(path), sheet, cell_range, max_rows, formulas))
+
+
+@mcp.tool()
+def xlsx_query(path: str, sheet: str | None = None, where: list[dict] | None = None,
+               order_by: str | None = None, descending: bool = False,
+               columns: list[str] | None = None, limit: int = 50) -> str:
+    """Filter/sort/select rows of a table whose header is row 1. where=[{"column":"Amount","op":">","value":100}]
+    (ops: == != > >= < <= contains). Use this instead of sorting or filtering by hand."""
+    return _json_text(sheet_tools.query(_xlsx(path), sheet, where, order_by, descending, columns, limit))
+
+
+@mcp.tool()
+def xlsx_aggregate(path: str, sheet: str | None = None, column: str | None = None, op: str = "sum",
+                   where: list[dict] | None = None, group_by: str | None = None) -> str:
+    """Exact sum/avg/min/max/count of a column (header = row 1), optionally filtered (same where as
+    xlsx_query) or grouped. Use this instead of adding numbers yourself."""
+    return _json_text(sheet_tools.aggregate(_xlsx(path), sheet, column, op, where, group_by))
 
 
 @mcp.tool()
 def xlsx_write(path: str, rows: list[list], sheet: str = "Sheet1", replace_sheet: bool = True) -> str:
-    """Write rows to a sheet. Creates the file if missing; other sheets are kept."""
-    from openpyxl import Workbook, load_workbook
-    p = _p(path)
-    if p.exists():
-        wb = load_workbook(p)
-        if sheet in wb.sheetnames and replace_sheet:
-            del wb[sheet]
-        ws = wb[sheet] if sheet in wb.sheetnames else wb.create_sheet(sheet)
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = sheet
-    for r in rows:
-        ws.append(r)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(p)
-    return f"wrote {len(rows)} rows to {p.name}!{sheet}"
+    """Create a workbook or a sheet from rows (list of lists; strings starting with '=' become formulas).
+    replace_sheet=true DESTROYS an existing sheet of that name; to add to existing data use
+    xlsx_append_rows or xlsx_set_cells. Other sheets are kept."""
+    return sheet_tools.write(_p(path), rows, sheet, replace_sheet)
+
+
+@mcp.tool()
+def xlsx_append_rows(path: str, sheet: str, rows: list[list]) -> str:
+    """Append rows below the last used row of an existing sheet. Existing cells are never changed."""
+    return sheet_tools.append_rows(_p(path), sheet, rows)
+
+
+@mcp.tool()
+def xlsx_set_cells(path: str, sheet: str, cells: dict) -> str:
+    """Set specific cells, e.g. {"B3": 99, "D2": "=B2*C2"}. Returns each cell's old -> new value."""
+    return sheet_tools.set_cells(_p(path), sheet, cells)
 
 
 # ---------- harness only (test setup / checkers); never given to workers ----------

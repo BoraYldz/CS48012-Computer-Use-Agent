@@ -21,7 +21,8 @@ _CREATE_ACTION = re.compile(
 _DIRECTORY_WORDS = re.compile(r"\b(folder|directory|subfolder)\b", re.IGNORECASE)
 _POSITIVE_KINDS = {
     "path_exists", "text_contains", "text_equals", "xlsx_sheet_exists",
-    "xlsx_values_present", "xlsx_rows_present",
+    "xlsx_values_present", "xlsx_rows_present", "xlsx_cell_equals",
+    "xlsx_formula_present", "xlsx_data_row_count", "xlsx_aggregate_matches",
 }
 
 

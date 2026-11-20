@@ -4,6 +4,7 @@
     python -m agent.cli run "your request"   # free-form request inside the sandbox
     python -m agent.cli task 16 [--reset]    # task setup -> run -> deterministic check
     python -m agent.cli eval files --runs 3  # evaluation suite (see agent/evalrun.py)
+    python -m agent.cli eval sheet --runs 3  # Excel worker suite (tasks/sheet_suite.py)
 
 Destructive actions (delete_path, overwrite) ask for approval on the terminal;
 pass --auto-approve to approve them without asking (used for unattended runs only).
@@ -41,7 +42,7 @@ async def _main():
     r = sub.add_parser("run"); r.add_argument("request"); r.add_argument("--auto-approve", action="store_true")
     t = sub.add_parser("task"); t.add_argument("id", help="task ID (16 or quickfix)"); t.add_argument("--reset", action="store_true")
     t.add_argument("--auto-approve", action="store_true")
-    e = sub.add_parser("eval"); e.add_argument("suite", choices=["files"])
+    e = sub.add_parser("eval"); e.add_argument("suite", choices=["files", "sheet"])
     e.add_argument("--runs", type=int, default=3); e.add_argument("--only", default=None)
     e.add_argument("--tag", choices=["core", "extra", "all"], default="core")
     e.add_argument("--bound", choices=["on", "off"], default=None, help="ablation: planner-bound move tool")
@@ -59,7 +60,7 @@ async def _main():
 
     if a.cmd == "eval":
         from .evalrun import run_suite
-        await run_suite(vm, runs=a.runs, only=a.only, tag=a.tag, bound=a.bound)
+        await run_suite(vm, runs=a.runs, only=a.only, tag=a.tag, bound=a.bound, suite=a.suite)
         return
 
     if a.cmd == "ping":

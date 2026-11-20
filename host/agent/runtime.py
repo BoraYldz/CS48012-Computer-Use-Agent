@@ -24,6 +24,18 @@ if AGENT_SCOPE == "workspace" and AGENT_MODE != "local":
     raise ValueError("AGENT_SCOPE=workspace is currently supported only with AGENT_MODE=local")
 LOCAL_ROOT = resolve_local_root(_RAW_LOCAL_ROOT, AGENT_SCOPE, _DEFAULT_LOCAL_ROOT)
 MAX_STEPS = int(os.getenv("MAX_STEPS_PER_SUBGOAL", "15"))
+# Per-worker step caps (cumulative per subgoal, Quick Fix included). Specialists get their own budget:
+# a spreadsheet subgoal is inspect -> (query/aggregate) -> write -> re-read, so it needs fewer steps.
+WORKER_MAX_STEPS = {
+    "files": MAX_STEPS,
+    "sheet": int(os.getenv("MAX_STEPS_SHEET", "12")),
+}
+
+
+def max_steps(capability: str) -> int:
+    return WORKER_MAX_STEPS.get(capability, MAX_STEPS)
+
+
 MAX_TOKENS = int(os.getenv("MAX_TOKENS_PER_TASK", "200000"))
 # Quick Fix is deliberately capped at two attempts per subgoal.
 MAX_QUICK_FIXES = min(2, max(0, int(os.getenv("MAX_QUICK_FIXES_PER_SUBGOAL", "2"))))
@@ -33,7 +45,11 @@ RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
 WORKER_TOOLS = {
     "files": ["list_dir", "path_info", "make_dirs", "move_path", "move_files", "copy_path",
               "read_text", "write_text", "read_pdf_text", "delete_path"],
-    "sheet": ["list_dir", "path_info", "read_text", "read_pdf_text", "xlsx_read", "xlsx_write"],
+    # Sheet worker: read-only file access for inputs (no move/copy/delete/write_text) plus the
+    # spreadsheet tools. Replacing existing sheet data is approval-gated inside xlsx_write.
+    "sheet": ["list_dir", "path_info", "read_text", "read_pdf_text",
+              "xlsx_info", "xlsx_read", "xlsx_query", "xlsx_aggregate",
+              "xlsx_write", "xlsx_append_rows", "xlsx_set_cells"],
 }
 
 

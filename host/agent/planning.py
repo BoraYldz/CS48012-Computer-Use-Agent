@@ -22,7 +22,32 @@ _PATH_ASSERTION_KINDS = {
     "xlsx_sheet_exists",
     "xlsx_values_present",
     "xlsx_rows_present",
+    "xlsx_cell_equals",
+    "xlsx_formula_present",
+    "xlsx_data_row_count",
+    "xlsx_aggregate_matches",
 }
+
+
+def _anchor_key(assertion: dict[str, Any], key: str, anchor: str,
+                subgoal: dict[str, Any], changes: list[dict[str, str]]) -> None:
+    """Prefix one path-valued field of an assertion with the leading location anchor."""
+    original = assertion.get(key)
+    if not isinstance(original, str) or not original.strip():
+        return
+    normalized = original.replace("\\", "/")
+    posix_path = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(original)
+    if (posix_path.is_absolute() or windows_path.is_absolute()
+            or windows_path.drive or ".." in posix_path.parts):
+        return
+    clean_path = normalized.lstrip("./")
+    first_part = PurePosixPath(clean_path).parts[:1]
+    if first_part and first_part[0].casefold() == anchor.casefold():
+        return
+    corrected = f"{anchor}/{clean_path}"
+    assertion[key] = corrected
+    changes.append({"from": original, "to": corrected, "subgoal_id": str(subgoal.get("id", "?"))})
 
 
 def apply_explicit_location_anchor(
@@ -57,26 +82,8 @@ def apply_explicit_location_anchor(
                 continue
             if assertion.get("kind") not in _PATH_ASSERTION_KINDS:
                 continue
-            original = assertion.get("path")
-            if not isinstance(original, str) or not original.strip():
-                continue
-
-            normalized = original.replace("\\", "/")
-            posix_path = PurePosixPath(normalized)
-            windows_path = PureWindowsPath(original)
-            if (posix_path.is_absolute() or windows_path.is_absolute()
-                    or windows_path.drive or ".." in posix_path.parts):
-                continue
-
-            clean_path = normalized.lstrip("./")
-            first_part = PurePosixPath(clean_path).parts[:1]
-            if first_part and first_part[0].casefold() == anchor.casefold():
-                continue
-
-            corrected = f"{anchor}/{clean_path}"
-            assertion["path"] = corrected
-            changes.append({"from": original, "to": corrected,
-                            "subgoal_id": str(subgoal.get("id", "?"))})
+            for key in ("path", "source_path"):
+                _anchor_key(assertion, key, anchor, subgoal, changes)
 
     return {"anchor": anchor, "changes": changes}
 

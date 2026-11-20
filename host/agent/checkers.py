@@ -4,10 +4,13 @@ A check is deliberately conservative: it returns PASS only when the requested
 postcondition was observed, FAIL when an inspected postcondition is false, and
 UNKNOWN when the claim cannot be checked with the available tools/evidence.
 """
+import re
 from pathlib import PurePosixPath
 from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from .sheet_tools import digest_rows
 
 
 CellValue = str | int | float | bool | None
@@ -18,7 +21,7 @@ class CheckAssertion(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: str = Field(description="Supported: path_exists, path_absent, directory_empty, directory_contains_files, files_moved_by_extension, no_files_by_extension, text_contains, text_equals, xlsx_sheet_exists, xlsx_values_present, xlsx_rows_present")
+    kind: str = Field(description="Supported: path_exists, path_absent, directory_empty, directory_contains_files, files_moved_by_extension, no_files_by_extension, text_contains, text_equals, xlsx_sheet_exists, xlsx_values_present, xlsx_rows_present, xlsx_cell_equals, xlsx_formula_present, xlsx_data_row_count, xlsx_aggregate_matches, xlsx_sheets_preserved")
     path: str | None = None
     is_dir: bool | None = None
     text: str | None = None
@@ -32,6 +35,17 @@ class CheckAssertion(BaseModel):
     snapshot_error: str | None = None
     recursive: bool | None = None
     preserved_files: list[dict[str, Any]] | None = None
+    # spreadsheet assertions
+    cell: str | None = None                  # A1-style address
+    value: CellValue = None                  # expected cell value
+    tolerance: float | None = None           # numeric tolerance for cell comparisons
+    contains: str | None = None              # substring a formula must contain
+    count: int | None = None                 # expected number of data rows (rows below the header)
+    column: str | None = None                # header name or column letter in the source table
+    op: str | None = None                    # sum | avg | min | max | count
+    source_path: str | None = None           # workbook the aggregate is computed from
+    source_sheet: str | None = None
+    preserved_sheets: dict[str, str] | None = None   # orchestrator-filled sheet digests
 
 
 class CheckSpec(BaseModel):
@@ -53,7 +67,9 @@ COMMON_CHECKS = {"path_exists", "path_absent"}
 CHECKS_BY_CAPABILITY = {
     "files": COMMON_CHECKS | {"directory_empty", "directory_contains_files", "files_moved_by_extension", "no_files_by_extension", "text_contains", "text_equals"},
     "sheet": COMMON_CHECKS | {
-        "xlsx_sheet_exists", "xlsx_values_present", "xlsx_rows_present"
+        "xlsx_sheet_exists", "xlsx_values_present", "xlsx_rows_present",
+        "xlsx_cell_equals", "xlsx_formula_present", "xlsx_data_row_count",
+        "xlsx_aggregate_matches", "xlsx_sheets_preserved",
     },
 }
 SUPPORTED_CHECKS = set().union(*CHECKS_BY_CAPABILITY.values())
@@ -82,6 +98,173 @@ def _row_matches(actual: list[Any], expected: list[Any]) -> bool:
     return actual[:len(expected)] == expected
 
 
+# ---------------------------------------------------------------- spreadsheet checks
+XLSX_EXTRA_CHECKS = {"xlsx_cell_equals", "xlsx_formula_present", "xlsx_data_row_count",
+                     "xlsx_aggregate_matches", "xlsx_sheets_preserved"}
+_CELL_ADDR = re.compile(r"^[A-Za-z]{1,3}[1-9]\d*$")
+
+
+def _isnum(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _norm_formula(text: str) -> str:
+    return re.sub(r"[\s$]", "", text).upper()
+
+
+async def _workbook_state(vm, kind: str, path: str, sheet: str | None) -> tuple[str, str] | None:
+    """Return a terminal (status, message) when the workbook/sheet is unusable, else None."""
+    info = await vm.call("path_info", path=path)
+    if not isinstance(info, dict) or "exists" not in info:
+        return _unknown(f"{kind} {path!r}: path_info returned an unexpected result")
+    if not info["exists"]:
+        return _fail(f"{kind} {path!r}: workbook does not exist")
+    if info.get("is_dir"):
+        return _fail(f"{kind} {path!r}: expected a workbook file, found a directory")
+    if sheet:
+        head = await vm.call("xlsx_read", path=path, max_rows=1)
+        names = head.get("sheets") if isinstance(head, dict) else None
+        if not isinstance(names, list):
+            return _unknown(f"{kind} {path!r}: xlsx_read returned an unexpected result")
+        if sheet not in names:
+            return _fail(f"{kind} {path!r}: sheet {sheet!r} is missing (sheets: {names})")
+    return None
+
+
+async def _read_one_cell(vm, path: str, sheet: str | None, cell: str, formulas: bool = False):
+    kwargs: dict[str, Any] = {"path": path, "cell_range": cell, "max_rows": 1, "formulas": formulas}
+    if sheet:
+        kwargs["sheet"] = sheet
+    book = await vm.call("xlsx_read", **kwargs)
+    if not isinstance(book, dict) or not isinstance(book.get("rows"), list) or not book["rows"]:
+        return None, False
+    return book["rows"][0][0], bool(book.get("uncomputed_formula_cells"))
+
+
+def _values_equal(actual: Any, expected: Any, tol: float) -> tuple[bool, str]:
+    if _isnum(expected):
+        if not _isnum(actual):
+            hint = " (stored as text, not a number)" if isinstance(actual, str) and actual.strip() == str(expected) else ""
+            return False, f"is {actual!r}{hint}, expected number {expected!r}"
+        return abs(actual - expected) <= tol, f"is {actual!r}, expected {expected!r} (tolerance {tol})"
+    return actual == expected and type(actual) is type(expected), f"is {actual!r}, expected {expected!r}"
+
+
+async def _check_xlsx_extra(vm, kind: str, a: dict[str, Any]) -> tuple[str, str]:
+    path, sheet = a.get("path"), a.get("sheet")
+    sheet = sheet if isinstance(sheet, str) and sheet else None
+    blocked = await _workbook_state(vm, kind, path, sheet)
+    if blocked:
+        return blocked
+
+    if kind == "xlsx_sheets_preserved":
+        saved = a.get("preserved_sheets")
+        if not isinstance(saved, dict):
+            return _unknown(f"xlsx_sheets_preserved {path!r}: no plan-time snapshot available")
+        head = await vm.call("xlsx_read", path=path, max_rows=1)
+        names = head.get("sheets", []) if isinstance(head, dict) else []
+        lost, altered = [], []
+        for name, digest in saved.items():
+            if name not in names:
+                lost.append(name)
+                continue
+            book = await vm.call("xlsx_read", path=path, sheet=name, formulas=True, max_rows=5000)
+            if digest_rows(book.get("rows", [])) != digest:
+                altered.append(name)
+        if lost or altered:
+            parts = []
+            if lost:
+                parts.append(f"COLLATERAL DAMAGE, sheets that must be kept were deleted: {sorted(lost)}")
+            if altered:
+                parts.append(f"COLLATERAL DAMAGE, sheets that must stay unchanged were modified: {sorted(altered)}")
+            return _fail(f"xlsx_sheets_preserved {path!r}: " + "; ".join(parts))
+        return _pass(f"xlsx_sheets_preserved {path!r}: {len(saved)} other sheet(s) verified unchanged")
+
+    if kind in {"xlsx_cell_equals", "xlsx_formula_present", "xlsx_aggregate_matches"}:
+        cell = a.get("cell")
+        if not isinstance(cell, str) or not _CELL_ADDR.match(cell):
+            return _unknown(f"{kind} {path!r}: cell must be an A1-style address, got {cell!r}")
+
+    if kind == "xlsx_formula_present":
+        raw, _ = await _read_one_cell(vm, path, sheet, cell, formulas=True)
+        if not (isinstance(raw, str) and raw.startswith("=")):
+            return _fail(f"xlsx_formula_present {path!r} {cell}: holds {raw!r}, not a formula")
+        needle = a.get("contains")
+        if isinstance(needle, str) and needle and _norm_formula(needle) not in _norm_formula(raw):
+            return _fail(f"xlsx_formula_present {path!r} {cell}: formula {raw!r} does not contain {needle!r}")
+        return _pass(f"xlsx_formula_present {path!r} {cell}: formula {raw!r}")
+
+    if kind == "xlsx_cell_equals":
+        expected = a.get("value")
+        if expected is None:
+            return _unknown(f"xlsx_cell_equals {path!r} {cell}: expected value is missing")
+        actual, uncomputed = await _read_one_cell(vm, path, sheet, cell)
+        if uncomputed:
+            return _unknown(f"xlsx_cell_equals {path!r} {cell}: formula could not be computed by the verifier")
+        ok, msg = _values_equal(actual, expected, float(a.get("tolerance") if a.get("tolerance") is not None else 1e-6))
+        return (_pass if ok else _fail)(f"xlsx_cell_equals {path!r} {cell}: {msg}")
+
+    if kind == "xlsx_data_row_count":
+        expected = a.get("count")
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+            return _unknown(f"xlsx_data_row_count {path!r}: count must be a non-negative integer")
+        kwargs: dict[str, Any] = {"path": path, "max_rows": 5000}
+        if sheet:
+            kwargs["sheet"] = sheet
+        book = await vm.call("xlsx_read", **kwargs)
+        if not isinstance(book, dict) or not isinstance(book.get("rows"), list):
+            return _unknown(f"xlsx_data_row_count {path!r}: xlsx_read returned an unexpected result")
+        if book.get("truncated"):
+            return _unknown(f"xlsx_data_row_count {path!r}: sheet larger than the 5000 inspected rows")
+        actual = sum(1 for r in book["rows"][1:] if any(v not in (None, "") for v in r))
+        if actual == expected:
+            return _pass(f"xlsx_data_row_count {path!r}: {actual} data row(s) below the header")
+        return _fail(f"xlsx_data_row_count {path!r}: {actual} data row(s) below the header, expected {expected}")
+
+    # xlsx_aggregate_matches: the expected number is recomputed from the SOURCE data in code.
+    src, op, column = a.get("source_path"), (a.get("op") or "").lower(), a.get("column")
+    if not isinstance(src, str) or not src or op not in {"sum", "avg", "min", "max", "count"} or not isinstance(column, str) or not column:
+        return _unknown("xlsx_aggregate_matches: needs source_path, column and op (sum/avg/min/max/count)")
+    source_sheet = a.get("source_sheet") if isinstance(a.get("source_sheet"), str) and a.get("source_sheet") else None
+    blocked = await _workbook_state(vm, kind, src, source_sheet)
+    if blocked:
+        return blocked
+    kwargs = {"path": src, "max_rows": 5000}
+    if source_sheet:
+        kwargs["sheet"] = source_sheet
+    book = await vm.call("xlsx_read", **kwargs)
+    rows = book.get("rows") if isinstance(book, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return _unknown(f"xlsx_aggregate_matches {src!r}: xlsx_read returned an unexpected result")
+    if book.get("truncated"):
+        return _unknown(f"xlsx_aggregate_matches {src!r}: source larger than the 5000 inspected rows")
+    header = rows[0]
+    idx = next((i for i, h in enumerate(header) if h is not None and str(h).strip().casefold() == column.strip().casefold()), None)
+    if idx is None and re.fullmatch(r"[A-Za-z]{1,3}", column.strip()):
+        from openpyxl.utils import column_index_from_string
+        cand = column_index_from_string(column.strip().upper()) - 1
+        idx = cand if cand < len(header) else None
+    if idx is None:
+        return _unknown(f"xlsx_aggregate_matches {src!r}: column {column!r} not found in header {header}")
+    col = [r[idx] for r in rows[1:] if idx < len(r)]
+    nums = [float(v) for v in col if _isnum(v)]
+    if op == "count":
+        expected: float | None = float(sum(1 for v in col if v not in (None, "")))
+    elif not nums:
+        return _unknown(f"xlsx_aggregate_matches {src!r}: column {column!r} has no numeric values")
+    else:
+        expected = {"sum": sum(nums), "avg": sum(nums) / len(nums), "min": min(nums), "max": max(nums)}[op]
+    actual, uncomputed = await _read_one_cell(vm, path, sheet, cell)
+    if uncomputed:
+        return _unknown(f"xlsx_aggregate_matches {path!r} {cell}: formula could not be computed by the verifier")
+    tol = float(a.get("tolerance") if a.get("tolerance") is not None else 0.005)
+    if not _isnum(actual):
+        return _fail(f"xlsx_aggregate_matches {path!r} {cell}: holds {actual!r}, expected {op}({column}) = {expected:g}")
+    if abs(actual - expected) <= tol:
+        return _pass(f"xlsx_aggregate_matches {path!r} {cell}: {actual!r} equals {op}({column}) = {expected:g} recomputed from {src!r}")
+    return _fail(f"xlsx_aggregate_matches {path!r} {cell}: holds {actual!r} but {op}({column}) recomputed from {src!r} is {expected:g}")
+
+
 async def _check_assertion(vm, assertion: dict[str, Any], allowed_checks: set[str]) -> tuple[str, str]:
     kind = assertion.get("kind")
     path = assertion.get("path")
@@ -91,7 +274,7 @@ async def _check_assertion(vm, assertion: dict[str, Any], allowed_checks: set[st
     if kind not in allowed_checks:
         return _unknown(f"check kind {kind!r} is not available to this worker")
     if kind in {"path_exists", "path_absent", "directory_empty", "directory_contains_files", "no_files_by_extension", "text_contains", "text_equals",
-                "xlsx_sheet_exists", "xlsx_values_present", "xlsx_rows_present"}:
+                "xlsx_sheet_exists", "xlsx_values_present", "xlsx_rows_present", *XLSX_EXTRA_CHECKS}:
         if not isinstance(path, str) or not path.strip():
             return _unknown(f"{kind}: missing or invalid path")
         if any(ch in path for ch in "*?[]"):
@@ -101,6 +284,9 @@ async def _check_assertion(vm, assertion: dict[str, Any], allowed_checks: set[st
             )
 
     try:
+        if kind in XLSX_EXTRA_CHECKS:
+            return await _check_xlsx_extra(vm, kind, assertion)
+
         if kind == "directory_contains_files":
             entries = await vm.call("list_dir", path=path)
             if not isinstance(entries, list):

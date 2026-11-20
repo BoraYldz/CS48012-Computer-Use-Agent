@@ -38,8 +38,27 @@ VM mode can restore a clean snapshot before an attempt
 ## Safety gate and evaluation
 
 - **Human approval:** `delete_path` and any `overwrite=true` move/copy stop and ask on the terminal (`y/N`) before touching the disk; `--auto-approve` is for unattended runs only. With no approver configured the gate **fails closed**. Every decision is written to the run log (`approval` events).
-- **Eval suite:** `python -m agent.cli eval files --runs 3` runs 12 core tasks (14 with `--tag all`) inside `<AGENT_ROOT>/_eval/<task>/`. Each task is judged by an independent exact-file-tree (SHA-256) check, not by the planner's `check_spec`. Reported: success rate, pass^k, false-success count, steps, tokens. `--bound on|off` toggles the planner-bound move tool for an ablation. Results are saved to `host/runs/eval-files-*.json|md`.
+- **Eval suites:** `python -m agent.cli eval files|sheet --runs 3` runs 12 core tasks (14 with `--tag all`) inside `<AGENT_ROOT>/_eval/<task>/`. Each task is judged by an independent exact-file-tree (SHA-256) check, not by the planner's `check_spec`. Reported: success rate, pass^k, false-success count, steps, tokens. `--bound on|off` toggles the planner-bound move tool for an ablation. Results are saved to `host/runs/eval-files-*.json|md`.
 - `tests/test_files_suite.py` proves each eval check accepts a reference solution and rejects a do-nothing baseline, with no LLM.
+
+## Spreadsheet (Sheet) worker
+
+A specialist, not a generic ReAct loop: its own prompt, tool list, step cap, observation format and checker.
+
+| | Files worker | Sheet worker |
+|---|---|---|
+| Tools | list/move/copy/read/write/delete | `xlsx_info`, `xlsx_read` (range, computed values or formulas), `xlsx_query` (filter/sort), `xlsx_aggregate` (sum/avg/min/max/count, group_by), `xlsx_write`, `xlsx_append_rows`, `xlsx_set_cells` + read-only `list_dir`, `path_info`, `read_text`, `read_pdf_text` |
+| Cannot | - | move, copy, delete, write arbitrary text files |
+| Step cap | `MAX_STEPS_PER_SUBGOAL` (15) | `MAX_STEPS_SHEET` (12) |
+| Observations | JSON listings | bounded rows, `truncated` flag, ISO dates, `uncomputed_formula_cells`, before -> after diff for edits |
+| Human gate | `delete_path`, overwrite | `xlsx_write` that would replace a sheet that already has data |
+| Checker | path / text / tree assertions | `xlsx_cell_equals`, `xlsx_formula_present`, `xlsx_data_row_count`, `xlsx_aggregate_matches` (expected value **recomputed from the source data in code**), plus the earlier sheet/values/rows kinds |
+
+- **Calculator tools:** a small local model never adds up or sorts numbers itself; it calls `xlsx_aggregate` / `xlsx_query` and writes the returned numbers.
+- **Formulas:** `agent/sheet_tools.py` contains a small evaluator (`+ - * / ^ &`, comparisons, `SUM AVERAGE MIN MAX COUNT ROUND ABS IF AND OR NOT`, cross-sheet refs). openpyxl never computes formulas, so a freshly written `=SUM(B2:B6)` has no cached value; the evaluator lets the worker and the checker see real numbers without Excel or LibreOffice. Unsupported functions are reported as `uncomputed_formula_cells`, never guessed, and the checker returns UNKNOWN for them.
+- **Sheet-state contract** (`agent/sheet_contracts.py`): before the first attempt of a sheet subgoal the orchestrator digests every sheet the check_spec does *not* name (and every sheet of a read-only `source_path` workbook) and appends an `xlsx_sheets_preserved` assertion. If the worker touches anything else the subgoal fails with `COLLATERAL DAMAGE`, whatever the planner wrote. The snapshot is lazy, so a workbook created by an earlier subgoal (e.g. a copy made by the Files worker) is protected too.
+- **Eval:** `python -m agent.cli eval sheet --runs 3` runs 13 core tasks (14 with `--tag all`), judged by an independent cell-by-cell check of the final workbook (types, formulas, sheet set). `tests/test_sheet_suite.py` proves every check accepts a reference solution, rejects do-nothing and rejects the typical wrong answers (numbers stored as text, replaced instead of appended, pasted value instead of formula, collateral damage, injected instruction followed).
+- `vm/sheet_tools.py` is a byte-identical copy of `host/agent/sheet_tools.py` (a test enforces it); the VM server exposes the same tools. The VM server has no approval gate yet; the human gate currently exists only in local mode.
 
 ## Quick start (local mode; no VM required)
 

@@ -1,6 +1,7 @@
 """Evaluation runner: N runs per task -> success, pass^k, false-success, steps, tokens.
 
     python -m agent.cli eval files --runs 3                 # core tasks x 3
+    python -m agent.cli eval sheet --runs 3                 # Excel worker suite x 3
     python -m agent.cli eval files --runs 1 --only t01,t09  # quick smoke
     python -m agent.cli eval files --runs 3 --bound on      # ablation: planner-bound move tool
 
@@ -20,14 +21,17 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from tasks import files_suite
+from tasks import files_suite, sheet_suite
 
 from .graph import run_goal
-from .runtime import AGENT_SCOPE, RUNS_DIR, RunLog, unload_models
+from .runtime import AGENT_SCOPE, RUNS_DIR, RunLog, max_steps, unload_models
+
+
+SUITES = {"files": files_suite, "sheet": sheet_suite}
 
 
 async def run_one(vm, task, k: int) -> dict:
-    base = await files_suite.reset(vm, task)
+    base = await files_suite.reset(vm, task)       # generic: wipes only _eval/<task id>/ and re-runs task.setup
     policy = task.approve
     vm.approver = lambda req, _p=policy: _p          # approval policy for this task
     run_id = f"eval-{task.id}-r{k}-{uuid.uuid4().hex[:6]}"
@@ -105,17 +109,18 @@ def markdown(summary: dict, config: dict, runs: int) -> str:
     return "\n".join(lines)
 
 
-async def run_suite(vm, runs: int, only: str | None, tag: str, bound: str | None) -> dict:
+async def run_suite(vm, runs: int, only: str | None, tag: str, bound: str | None, suite: str = "files") -> dict:
     if bound:
         os.environ["BOUND_MOVE"] = "on" if bound == "on" else "off"
-    tasks = files_suite.select(only=only, tag=tag)
+    tasks = SUITES[suite].select(only=only, tag=tag)
     if not tasks:
         raise SystemExit(f"no tasks matched only={only!r} tag={tag!r}")
     config = {
-        "scope": AGENT_SCOPE, "root": str(vm.root), "runs": runs,
+        "suite": suite, "scope": AGENT_SCOPE, "root": str(vm.root), "runs": runs,
         "bound_move": os.getenv("BOUND_MOVE", "off"),
         "worker_model": os.getenv("WORKER_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b")),
         "planner_model": os.getenv("PLANNER_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b")),
+        "max_steps": {"files": max_steps("files"), "sheet": max_steps("sheet")},
     }
     print(f"eval: {len(tasks)} task(s) x {runs} run(s) under {vm.root}/{files_suite.EVAL_ROOT}/")
     rows: list[dict] = []
@@ -132,7 +137,7 @@ async def run_suite(vm, runs: int, only: str | None, tag: str, bound: str | None
     summary = aggregate(rows, runs)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     RUNS_DIR.mkdir(exist_ok=True)
-    out = RUNS_DIR / f"eval-files-{stamp}"
+    out = RUNS_DIR / f"eval-{suite}-{stamp}"
     out.with_suffix(".json").write_text(json.dumps({"config": config, "summary": summary, "rows": rows},
                                                    indent=2, ensure_ascii=False))
     md = markdown(summary, config, runs)
