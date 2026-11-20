@@ -6,6 +6,8 @@ Start it at logon (Task Scheduler), never as a Windows service.
     python server.py            # listens on 0.0.0.0:8765, MCP at /mcp, health at /health
 """
 import base64
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -29,6 +31,19 @@ PORT = int(os.environ.get("AGENT_PORT", "8765"))
 mcp = FastMCP("cua-vm", host="0.0.0.0", port=PORT)
 
 
+def _json_text(value) -> str:
+    """Serialize structured tool output as plain text for OpenAI-compatible clients."""
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _p(path: str) -> Path:
     """Resolve a path relative to ROOT and refuse anything outside it."""
     p = Path(path)
@@ -45,23 +60,30 @@ async def health(_: Request) -> JSONResponse:
 
 # ---------- files ----------
 @mcp.tool()
-def list_dir(path: str = ".", recursive: bool = False) -> list[dict]:
-    """List files and folders. Paths are relative to the user's home folder."""
+def list_dir(path: str = ".", recursive: bool = False) -> str:
+    """List files and folders as JSON text, including file size and SHA-256."""
     base = _p(path)
+    if not base.is_dir():
+        raise NotADirectoryError(f"not a directory: {path}")
     it = base.rglob("*") if recursive else base.iterdir()
-    return [
-        {"path": str(x.relative_to(ROOT)), "type": "dir" if x.is_dir() else "file",
-         "size": x.stat().st_size if x.is_file() else None}
-        for x in sorted(it)
-    ]
+    result = []
+    for item in sorted(it):
+        is_file = item.is_file()
+        result.append({
+            "path": str(item.relative_to(ROOT)),
+            "type": "file" if is_file else "dir",
+            "size": item.stat().st_size if is_file else None,
+            "sha256": _sha256(item) if is_file else None,
+        })
+    return _json_text(result)
 
 
 @mcp.tool()
-def path_info(path: str) -> dict:
-    """Does a path exist, is it a file or folder, and its size."""
+def path_info(path: str) -> str:
+    """Return path metadata as JSON text."""
     p = _p(path)
-    return {"exists": p.exists(), "is_dir": p.is_dir(),
-            "size": p.stat().st_size if p.is_file() else None}
+    return _json_text({"exists": p.exists(), "is_dir": p.is_dir(),
+                       "size": p.stat().st_size if p.is_file() else None})
 
 
 @mcp.tool()
@@ -73,13 +95,61 @@ def make_dirs(path: str) -> str:
 
 @mcp.tool()
 def move_path(src: str, dst: str, overwrite: bool = False) -> str:
-    """Move or rename a file/folder. Refuses to overwrite unless overwrite=True."""
+    """Move one literal file/folder path. No wildcard patterns; list_dir and move each matching file separately."""
+    if any(ch in src for ch in "*?[") or any(ch in dst for ch in "*?["):
+        raise ValueError(
+            "move_path accepts one literal path and does not expand wildcards. "
+            "Call list_dir on the source folder, then move each matching file using its exact returned path."
+        )
     s, d = _p(src), _p(dst)
     if d.exists() and not overwrite:
         raise FileExistsError(f"destination exists: {d}")
     d.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(s), str(d))
     return "ok"
+
+
+@mcp.tool()
+def move_files(src_dir: str, filenames: list[str], dst_dir: str) -> str:
+    """Move an explicit list of files into a destination folder, preserving filenames.
+
+    The destination folder is created when needed. Each filename must be an exact
+    basename (not a path or wildcard). Existing destination files are never overwritten.
+    """
+    source_dir = _p(src_dir)
+    destination_dir = _p(dst_dir)
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"source directory does not exist or is not a directory: {src_dir}")
+    if not isinstance(filenames, list) or not filenames:
+        raise ValueError("filenames must be a non-empty list of exact file names returned by list_dir")
+    if destination_dir == source_dir:
+        raise ValueError("source and destination directories must be different")
+
+    source_paths: list[tuple[str, Path, Path]] = []
+    seen: set[str] = set()
+    for filename in filenames:
+        if not isinstance(filename, str) or not filename.strip():
+            raise ValueError("each filename must be a non-empty string")
+        candidate_name = Path(filename)
+        if candidate_name.name != filename or filename in {".", ".."} or any(ch in filename for ch in "*?[]"):
+            raise ValueError(f"expected an exact basename, not a path or wildcard: {filename!r}")
+        if filename in seen:
+            raise ValueError(f"duplicate filename in move request: {filename}")
+        seen.add(filename)
+        source = _p((source_dir / filename).relative_to(ROOT).as_posix())
+        if not source.is_file():
+            raise FileNotFoundError(f"source file does not exist: {src_dir}/{filename}")
+        destination = _p((destination_dir / filename).relative_to(ROOT).as_posix())
+        if destination.exists():
+            raise FileExistsError(f"destination file already exists: {dst_dir}/{filename}")
+        source_paths.append((filename, source, destination))
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[str] = []
+    for filename, source, destination in source_paths:
+        shutil.move(str(source), str(destination))
+        moved.append(filename)
+    return _json_text({"moved": moved, "count": len(moved), "destination": dst_dir})
 
 
 @mcp.tool()
@@ -117,13 +187,15 @@ def read_pdf_text(path: str, max_chars: int = 20000) -> str:
 
 # ---------- spreadsheets ----------
 @mcp.tool()
-def xlsx_read(path: str, sheet: str | None = None, max_rows: int = 500) -> dict:
+def xlsx_read(path: str, sheet: str | None = None, max_rows: int = 500) -> str:
     """Read an .xlsx sheet as rows of values. Returns sheet names too."""
     from openpyxl import load_workbook
     wb = load_workbook(_p(path), data_only=True)
     ws = wb[sheet] if sheet else wb.active
+    total_rows = ws.max_row
     rows = [list(r) for r in ws.iter_rows(values_only=True, max_row=max_rows)]
-    return {"sheets": wb.sheetnames, "sheet": ws.title, "rows": rows}
+    return _json_text({"sheets": wb.sheetnames, "sheet": ws.title, "rows": rows,
+                       "total_rows": total_rows, "truncated": total_rows > max_rows})
 
 
 @mcp.tool()
@@ -161,6 +233,19 @@ def harness_put_file(path: str, b64: str) -> str:
 def harness_get_file(path: str) -> str:
     """HARNESS ONLY: fetch a file's bytes (base64) for checking."""
     return base64.b64encode(_p(path).read_bytes()).decode()
+
+
+@mcp.tool()
+def harness_remove_path(path: str) -> str:
+    """HARNESS ONLY: remove one task-owned fixture/output path."""
+    p = _p(path)
+    if p == ROOT:
+        raise ValueError("refusing to remove the sandbox root")
+    if p.is_dir():
+        shutil.rmtree(p)
+    elif p.exists():
+        p.unlink()
+    return "ok"
 
 
 if __name__ == "__main__":

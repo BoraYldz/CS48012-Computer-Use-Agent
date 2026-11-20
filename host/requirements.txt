@@ -3,3 +3,5 @@ langchain-openai
 langchain-mcp-adapters
 mcp
 python-dotenv
+openpyxl
+pypdf
