@@ -3,6 +3,7 @@
 Milestone 1: subgoals run in order, one worker at a time.
 Milestone 2 adds the reflector between `check` (fail) and `worker` (retry).
 """
+import asyncio
 import json
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -11,16 +12,27 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 
+from . import gui
 from .runtime import MAX_STEPS, MAX_TOKENS, WORKER_TOOLS, VM, RunLog, model
 from .state import AgentState
 
-PLANNER_PROMPT = """You are the orchestrator of a desktop agent working inside a Windows VM.
+# One line per worker; the planner only sees the workers that are available in this run
+# (files/sheet need the tool server, gui needs nothing but this PC's screen).
+CAPABILITY_HELP = {
+    "files": "list, create, move, rename, copy files and folders; read text and PDF files",
+    "sheet": "read and write .xlsx spreadsheets (it can also read text/PDF files for input data)",
+    "gui": gui.HELP,
+}
+ALL_CAPABILITIES = [*WORKER_TOOLS, "gui"]
+
+PLANNER_PROMPT = """You are the orchestrator of a desktop agent working on a Windows PC.
 Break the user's request into a short ordered list of subgoals (usually 1-4).
 Each subgoal goes to ONE specialist worker:
-- files: list, create, move, rename, copy files and folders; read text and PDF files
-- sheet: read and write .xlsx spreadsheets (it can also read text/PDF files for input data)
+{workers}
 Paths are relative to the user's home folder (e.g. "Downloads/report.xlsx").
-Keep subgoals concrete and checkable. Do not invent files that were not mentioned."""
+Keep subgoals concrete and checkable. Do not invent files that were not mentioned.
+For the gui worker, write the instruction as one self-contained task in plain words and put
+every exact value (addresses, names, text to type) in it."""
 
 WORKER_PROMPT = """You are the {cap} worker of a desktop agent. Complete ONLY this subgoal using your tools.
 Paths are relative to the user's home folder. Look before you act (list folders, read files).
@@ -29,7 +41,7 @@ When finished, reply with one short line starting with DONE: or FAILED: and what
 
 
 class PlannedSubgoal(BaseModel):
-    capability: str = Field(description=f"one of {list(WORKER_TOOLS)}")
+    capability: str = Field(description=f"one of {ALL_CAPABILITIES}")
     instruction: str
     expected_output: str
 
@@ -49,26 +61,50 @@ def _tokens(msg) -> int:
     return int(u.get("total_tokens", 0))
 
 
-def build_graph(vm: VM, log: RunLog):
+def build_graph(vm: VM | None, log: RunLog):
+    # Without the tool server only the gui worker exists.
+    available = [*(WORKER_TOOLS if vm is not None else []), "gui"]
+    planner_prompt = PLANNER_PROMPT.format(
+        workers="\n".join(f"- {cap}: {CAPABILITY_HELP[cap]}" for cap in available))
 
     async def plan(state: AgentState):
         llm = model("planner").with_structured_output(Plan, include_raw=True)
-        out = await llm.ainvoke([("system", PLANNER_PROMPT), ("user", state["goal"])])
+        out = await llm.ainvoke([("system", planner_prompt), ("user", state["goal"])])
         parsed: Plan | None = out["parsed"]
         # Zero-token gate: validate the plan in code before any worker runs.
         if parsed is None or not parsed.subgoals:
             raise ValueError(f"planner returned no valid plan: {out.get('parsing_error')}")
-        bad = [s.capability for s in parsed.subgoals if s.capability not in WORKER_TOOLS]
+        bad = [s.capability for s in parsed.subgoals if s.capability not in available]
         if bad:
-            raise ValueError(f"planner used unknown capabilities: {bad}")
+            raise ValueError(f"planner used unknown or unavailable capabilities: {bad}")
         subgoals = [{"id": i, **s.model_dump()} for i, s in enumerate(parsed.subgoals)]
         log.write("plan", subgoals=subgoals)
         return {"subgoals": subgoals, "current": 0,
                 "tokens_used": state.get("tokens_used", 0) + _tokens(out["raw"])}
 
+    async def gui_worker(state: AgentState, sg):
+        # The GUI worker blocks while it drives the screen, so it runs in a thread.
+        log.write("worker_start", subgoal=sg["id"], worker="gui")
+        allowance = MAX_TOKENS - state.get("tokens_used", 0)
+        try:
+            result = await asyncio.to_thread(
+                gui.run_gui_subgoal, sg["instruction"], sg["expected_output"], state["goal"],
+                state.get("lessons", []), f"{state.get('run_id', 'run')}-sg{sg['id']}", allowance)
+        except Exception as error:  # missing key or packages: a failed subgoal, not a crash
+            result = {"status": "error", "reason": f"{type(error).__name__}: {error}"[:200]}
+        steps, summary, tokens = gui.gui_findings(result, sg["id"])
+        for step in steps:
+            log.write("step", **step)
+        log.write("worker_end", subgoal=sg["id"], summary=summary, tokens=tokens,
+                  gui_status=result.get("status"), gui_run_id=result.get("run_id"))
+        return {"history": steps, "findings": [f"[{sg['id']}] {summary}"],
+                "tokens_used": state.get("tokens_used", 0) + tokens}
+
     async def worker(state: AgentState):
         sg = state["subgoals"][state["current"]]
         cap = sg["capability"]
+        if cap == "gui":
+            return await gui_worker(state, sg)
         agent = create_react_agent(model("worker"), vm.for_worker(cap),
                                    prompt=WORKER_PROMPT.format(cap=cap))
         msg = (f"Overall goal (context only): {state['goal']}\n"
@@ -128,7 +164,7 @@ def build_graph(vm: VM, log: RunLog):
     return g.compile()
 
 
-async def run_goal(goal: str, vm: VM, log: RunLog, run_id: str) -> AgentState:
+async def run_goal(goal: str, vm: VM | None, log: RunLog, run_id: str) -> AgentState:
     graph = build_graph(vm, log)
     log.write("run_start", goal=goal)
     final = await graph.ainvoke({"run_id": run_id, "goal": goal, "history": [], "findings": [],

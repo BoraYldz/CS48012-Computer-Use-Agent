@@ -2,7 +2,7 @@
 import operator
 from typing import Annotated, Literal, TypedDict
 
-Capability = Literal["files", "sheet"]  # Milestone 1. Later: "web", "doc", "research", "gui"
+Capability = Literal["files", "sheet", "gui"]  # Later: "web", "doc", "research"
 
 
 class Subgoal(TypedDict):

@@ -3,6 +3,9 @@
     python -m agent.cli ping                 # is the VM tool server reachable?
     python -m agent.cli run "your request"   # free-form request
     python -m agent.cli task 16 [--reset]    # suite task: (reset VM) -> setup -> run -> check
+
+`run` also works without the VM tool server: then only the gui worker is available, and it
+operates this PC's own screen.
 """
 import argparse
 import asyncio
@@ -11,7 +14,7 @@ import uuid
 from pathlib import Path
 
 from .graph import run_goal, summarize
-from .runtime import VM, RunLog
+from .runtime import VM, VM_MCP_URL, RunLog
 
 RESET = Path(__file__).resolve().parent.parent / "reset_vm.ps1"
 
@@ -31,7 +34,14 @@ async def main():
     if a.cmd == "task" and a.reset:
         subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", str(RESET)], check=True)
 
-    vm = await VM().connect()
+    try:
+        vm = await VM().connect()
+    except Exception as error:  # no tool server: only the gui worker can run
+        if a.cmd != "run":
+            raise SystemExit(f"VM tool server not reachable at {VM_MCP_URL} ({type(error).__name__})")
+        vm = None
+        print(f"[no tool server at {VM_MCP_URL}: only the gui worker is available; "
+              "it will use this PC's screen]")
 
     if a.cmd == "ping":
         print("tools:", sorted(vm.tools))
