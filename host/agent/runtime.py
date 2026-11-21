@@ -48,8 +48,9 @@ WORKER_TOOLS = {
     # Sheet worker: read-only file access for inputs (no move/copy/delete/write_text) plus the
     # spreadsheet tools. Replacing existing sheet data is approval-gated inside xlsx_write.
     "sheet": ["list_dir", "path_info", "read_text", "read_pdf_text",
-              "xlsx_info", "xlsx_read", "xlsx_query", "xlsx_aggregate",
-              "xlsx_write", "xlsx_group_summary", "xlsx_append_rows", "xlsx_set_cells"],
+              "xlsx_info", "xlsx_read", "xlsx_import_csv", "xlsx_query", "xlsx_aggregate",
+              "xlsx_write", "xlsx_group_summary", "xlsx_append_rows", "xlsx_set_cells",
+              "xlsx_update_row", "xlsx_add_formula_column"],
 }
 
 

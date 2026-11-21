@@ -23,6 +23,7 @@ _POSITIVE_KINDS = {
     "path_exists", "text_contains", "text_equals", "xlsx_sheet_exists",
     "xlsx_values_present", "xlsx_rows_present", "xlsx_cell_equals",
     "xlsx_formula_present", "xlsx_data_row_count", "xlsx_aggregate_matches", "xlsx_group_aggregate_matches",
+    "xlsx_csv_matches", "file_content_matches",
 }
 
 
@@ -400,6 +401,86 @@ _SORT_OUTPUT_RE = re.compile(
 )
 
 
+def build_deterministic_file_sort_plan(goal: str) -> list[dict[str, Any]] | None:
+    """Build a safe plan for explicit extension sorting when the source must end empty.
+
+    This narrow fast path avoids spending several minutes asking the LLM to decompose a
+    fully specified extension-to-folder mapping. It intentionally declines ambiguous
+    destinations: it only applies when the request names the source, output folder, every
+    extension/folder mapping, and explicitly requires the source folder to be empty.
+    The normal planning pipeline still snapshots exact basenames and SHA-256 hashes before
+    any worker runs.
+    """
+    goal = goal or ""
+    source_match = _SORT_SOURCE_RE.search(goal)
+    output_match = _SORT_OUTPUT_RE.search(goal)
+    mappings = [
+        ("." + match.group(1).casefold(), match.group(2))
+        for match in _SORT_MAPPING_RE.finditer(goal)
+    ]
+    if not source_match or not output_match or not mappings:
+        return None
+
+    source_dir = source_match.group(1).rstrip(".,;:")
+    # Do not pre-plan generic moves or copy operations. The fast path is for an
+    # explicitly requested move whose source directory must be empty afterward.
+    if not re.search(r"\bmove\b", goal, re.IGNORECASE):
+        return None
+    empty_dirs = find_explicitly_empty_directories(goal, [])
+    if not any(_norm_path(item) == _norm_path(source_dir) for item in empty_dirs):
+        return None
+
+    by_extension: dict[str, str] = {}
+    used_folders: set[str] = set()
+    for extension, folder_name in mappings:
+        previous = by_extension.get(extension)
+        if previous is not None and previous.casefold() != folder_name.casefold():
+            return None
+        if folder_name.casefold() in used_folders and previous is None:
+            return None
+        by_extension[extension] = folder_name
+        used_folders.add(folder_name.casefold())
+    mappings = list(by_extension.items())
+    if not mappings:
+        return None
+
+    output_root = (PurePosixPath(source_dir).parent / output_match.group(1)).as_posix()
+    subgoals: list[dict[str, Any]] = []
+    for index, (extension, folder_name) in enumerate(mappings):
+        destination_dir = (PurePosixPath(output_root) / folder_name).as_posix()
+        subgoals.append({
+            "id": index,
+            "capability": "files",
+            "instruction": (
+                f"Move only {extension} files from {source_dir} into {destination_dir}. "
+                "Use list_dir to inspect the source and move the exact matching basenames "
+                "with move_files. Preserve original filenames and contents; do not move "
+                "other extensions or overwrite existing destination files."
+            ),
+            "expected_output": (
+                f"All original {extension} files are in {destination_dir}, absent from "
+                f"{source_dir}, with names and contents preserved."
+            ),
+            "check_spec": {
+                "checks": [
+                    {
+                        "kind": "files_moved_by_extension",
+                        "source_dir": source_dir,
+                        "destination_dir": destination_dir,
+                        "extension": extension,
+                        "expected_files": None,
+                    },
+                    {"kind": "path_exists", "path": destination_dir, "is_dir": True},
+                ],
+                "rationale": (
+                    f"Verify every snapshotted {extension} file was moved without content "
+                    "changes and the destination directory exists."
+                ),
+            },
+        })
+    return subgoals
+
+
 def normalize_file_sort_assertions(
     goal: str, subgoals: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -500,8 +581,9 @@ def normalize_file_sort_assertions(
         matching_subgoal["instruction"] = (
             f"Move only the {extension} files listed in the planning-time manifest "
             f"from {source_dir} into {destination_dir}. Preserve each original "
-            "filename and content. Use the scoped move_expected_files tool with "
-            "the exact basenames from the manifest. Do not move other extensions "
+            "filename and content. Use the exact-basename move tool specified in the "
+            "worker context (move_expected_files when bound moves are enabled, "
+            "otherwise move_files). Do not move other extensions "
             "or use a different destination."
         )
         matching_subgoal["expected_output"] = (
@@ -878,9 +960,11 @@ def anchor_sheet_paths_to_goal(goal: str, subgoals: list[dict[str, Any]]) -> lis
 
 _KIND_FIELDS = {
     "xlsx_sheet_exists": {"path", "sheet"},
+    "xlsx_csv_matches": {"path", "sheet", "source_path"},
     "xlsx_values_present": {"path", "sheet", "values"},
     "xlsx_rows_present": {"path", "sheet", "rows"},
-    "xlsx_cell_equals": {"path", "sheet", "cell", "value", "tolerance"},
+    # source_path is optional contract metadata for workflows that must preserve an input workbook.
+    "xlsx_cell_equals": {"path", "sheet", "cell", "value", "tolerance", "source_path"},
     "xlsx_formula_present": {"path", "sheet", "cell", "contains"},
     "xlsx_data_row_count": {"path", "sheet", "count"},
     "xlsx_aggregate_matches": {"path", "sheet", "cell", "source_path", "source_sheet", "column", "op", "tolerance"},
@@ -898,6 +982,22 @@ def _count_in_request(count: Any, scope: str) -> bool:
         return True                              # handled (dropped) by the integer rule later
     words = [_NUMBER_WORDS[n]] if 0 <= n < len(_NUMBER_WORDS) else []
     return any(re.search(rf"(?<![\w.]){re.escape(w)}(?![\w])", scope, re.IGNORECASE) for w in [str(n), *words])
+
+
+def _rows_are_grounded(rows: Any, scope: str) -> bool:
+    """True only when each asserted row occurs as a consecutive value sequence in the request."""
+    if not isinstance(rows, list) or not rows:
+        return False
+    for row in rows:
+        if not isinstance(row, list) or not row or any(value is None for value in row):
+            return False
+        values = [str(value).strip() for value in row]
+        # Only ordinary cell separators may appear between values. This prevents
+        # values taken from different rows/columns being fabricated into one row.
+        pattern = r"(?<![\w.])" + r"[\s,;|:'\"()\[\]\t]+".join(re.escape(v) for v in values) + r"(?![\w]|\.\d)"
+        if not re.search(pattern, scope, re.IGNORECASE):
+            return False
+    return True
 
 
 def _sanitize_sheet_assertion(a: dict[str, Any]) -> str | None:
@@ -951,6 +1051,8 @@ def normalize_sheet_checks(goal: str, subgoals: list[dict[str, Any]]) -> list[di
                 pass
             elif kind == "xlsx_data_row_count" and not _count_in_request(a.get("count"), scope):
                 why = "row count does not appear in the request (likely copied from the prompt example)"
+            elif kind == "xlsx_rows_present" and not _rows_are_grounded(a.get("rows"), scope):
+                why = "expected row values are not stated consecutively in the request"
             elif kind == "xlsx_formula_present" and not re.search(r"formula|=\s*[A-Za-z(]", scope, re.IGNORECASE):
                 why = "request does not ask for a formula"
             elif kind == "xlsx_cell_equals":
@@ -960,7 +1062,7 @@ def normalize_sheet_checks(goal: str, subgoals: list[dict[str, Any]]) -> list[di
             elif kind in {"xlsx_aggregate_matches", "xlsx_group_aggregate_matches"}:
                 same = (a.get("source_path") == a.get("path")
                         and (a.get("source_sheet") or None) == (a.get("sheet") or None))
-                if not a.get("source_path") or same or not _AGGREGATE_WORDS.search(scope):
+                if not why and (not a.get("source_path") or same or not _AGGREGATE_WORDS.search(scope)):
                     why = "no distinct source workbook/sheet or no aggregate requested"
             if why:
                 changes.append({"subgoal_id": sg.get("id"), "dropped": kind, "reason": why})
@@ -1049,4 +1151,256 @@ def consolidate_sheet_subgoals(subgoals: list[dict[str, Any]]) -> list[dict[str,
         for i, sg in enumerate(merged):
             sg["id"] = i
         subgoals[:] = merged
+    return changes
+
+# -------------------------------------------------- spreadsheet workflow routing
+
+def _goal_file_paths(goal: str, extension: str) -> list[str]:
+    """Return distinct, explicitly named paths with the requested extension, in goal order."""
+    wanted = extension.casefold()
+    out: list[str] = []
+    for raw in _GOAL_PATH.findall(goal or ""):
+        path = raw.rstrip(".,;:")
+        if PurePosixPath(path.replace("\\", "/")).suffix.casefold() == wanted and path not in out:
+            out.append(path)
+    return out
+
+
+def _goal_sheet_name(goal: str, fallback: str | None = None) -> str | None:
+    patterns = (
+        r"\bsheet\s+named\s+['\"]?([^'\".,;:\n()]+)",
+        r"\bsheet\s+['\"]?([A-Za-z0-9 _-]+?)['\"]?(?=\s*(?:\)|,|;|\.|$))",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, goal or "", re.IGNORECASE)
+        if match:
+            name = match.group(1).strip().strip("'\"")
+            if name:
+                return name
+    return fallback
+
+
+def _goal_cell_assignment(goal: str) -> tuple[str, Any] | None:
+    match = re.search(
+        r"\bcell\s+([A-Za-z]{1,3}[1-9]\d*)\s+(?:to|=)\s*(-?\d+(?:\.\d+)?)\b",
+        goal or "", re.IGNORECASE,
+    )
+    if not match:
+        return None
+    raw = match.group(2)
+    value: int | float = float(raw) if "." in raw else int(raw)
+    return match.group(1).upper(), value
+
+
+def normalize_spreadsheet_workflows(goal: str, subgoals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deterministically enforce the worker sequence for unambiguous XLSX workflows.
+
+    The planner still supplies ordinary spreadsheet plans. This boundary repairs three
+    high-confidence cases where routing the wrong specialist or omitting a required copy
+    operation would otherwise make a successful result impossible.
+    """
+    changes: list[dict[str, Any]] = []
+    goal_text = goal or ""
+    csv_paths = _goal_file_paths(goal_text, ".csv")
+    xlsx_paths = _goal_file_paths(goal_text, ".xlsx")
+    lowered = goal_text.casefold()
+
+    # A copy-then-edit task must create the copy with the Files worker before Sheet edits it.
+    is_copy_edit = (
+        len(xlsx_paths) >= 2
+        and re.search(r"\b(copy|make a copy|duplicate)\b", lowered)
+        and re.search(r"\b(edit|set cell|change|update|modify)\b", lowered)
+    )
+    if is_copy_edit:
+        source, destination = xlsx_paths[0], xlsx_paths[1]
+        sheet = _goal_sheet_name(goal_text, "Sheet1")
+        assignment = _goal_cell_assignment(goal_text)
+        if assignment:
+            cell, value = assignment
+            files_sg = {
+                "id": 0,
+                "capability": "files",
+                "instruction": f"Copy {source} to {destination}. Keep the source file unchanged.",
+                "expected_output": f"{destination} is an exact copy of {source}; the source remains present and unchanged.",
+                "check_spec": {"checks": [
+                    {"kind": "path_exists", "path": source, "is_dir": False},
+                    {"kind": "path_exists", "path": destination, "is_dir": False},
+                    {"kind": "file_content_matches", "path": destination, "source_path": source},
+                ], "rationale": "Verify the destination is a byte-identical copy and the source remains present."},
+            }
+            sheet_sg = {
+                "id": 1,
+                "capability": "sheet",
+                "instruction": f"In {destination}, sheet {sheet}, set cell {cell} to {value}. Do not change any other cell or sheet.",
+                "expected_output": f"{destination} has {sheet}!{cell} set to {value}; the original {source} remains untouched.",
+                "check_spec": {"checks": [
+                    {"kind": "xlsx_sheet_exists", "path": destination, "sheet": sheet},
+                    # source_path is consumed by the sheet-state contract, which snapshots
+                    # every sheet in the original template before the copy is edited.
+                    {"kind": "xlsx_cell_equals", "path": destination, "sheet": sheet,
+                     "cell": cell, "value": value, "source_path": source},
+                ], "rationale": "Verify the copied workbook was edited at the requested cell."},
+            }
+            subgoals[:] = [files_sg, sheet_sg]
+            changes.append({"workflow": "copy_then_edit", "source": source, "destination": destination,
+                            "action": "inserted_files_copy_before_sheet_edit"})
+            return changes
+
+    # CSV conversion is a single Sheet-worker operation using the actual source file.
+    is_csv_import = bool(csv_paths and xlsx_paths and re.search(r"\b(convert|import|transfer)\b", lowered))
+    if is_csv_import:
+        source, destination = csv_paths[0], xlsx_paths[-1]
+        sheet = _goal_sheet_name(goal_text, "Sheet1")
+        subgoals[:] = [{
+            "id": 0,
+            "capability": "sheet",
+            "instruction": f"Import every row from CSV {source} into a new workbook {destination} with one sheet named {sheet}. Preserve the header and row order, convert numeric data cells to numbers, and do not modify the CSV.",
+            "expected_output": f"{destination} contains an exact typed import of {source} in sheet {sheet}; the CSV is unchanged.",
+            "check_spec": {"checks": [
+                {"kind": "path_exists", "path": destination, "is_dir": False},
+                {"kind": "xlsx_sheet_exists", "path": destination, "sheet": sheet},
+                {"kind": "xlsx_csv_matches", "path": destination, "sheet": sheet, "source_path": source},
+            ], "rationale": "Compare the workbook cell-by-cell with the original CSV, including numeric cell types."},
+        }]
+        changes.append({"workflow": "csv_to_xlsx", "source": source, "destination": destination,
+                        "action": "routed_to_sheet_import_csv"})
+        return changes
+
+    # If the planner turned creation of a workbook into a Files-only directory task,
+    # promote the workbook work itself to the Sheet specialist. Parent directories are
+    # created automatically by the spreadsheet writer.
+    is_xlsx_creation = bool(
+        xlsx_paths
+        and re.search(r"\b(create|make|generate|build)\b", lowered)
+        and re.search(r"\b(workbook|spreadsheet|xlsx)\b", lowered)
+        and not is_copy_edit
+    )
+    if is_xlsx_creation and not any(sg.get("capability") == "sheet" for sg in subgoals):
+        destination = xlsx_paths[-1]
+        candidate_checks: list[dict[str, Any]] = []
+        for sg in subgoals:
+            spec = sg.get("check_spec") or {}
+            checks = spec.get("checks", []) if isinstance(spec, dict) else []
+            for assertion in checks:
+                if not isinstance(assertion, dict):
+                    continue
+                kind = assertion.get("kind")
+                if str(kind).startswith("xlsx_") and assertion.get("path") == destination:
+                    candidate_checks.append(dict(assertion))
+                elif kind == "path_exists" and assertion.get("path") == destination:
+                    candidate_checks.append(dict(assertion))
+        if not any(a.get("kind") == "path_exists" and a.get("path") == destination for a in candidate_checks):
+            candidate_checks.insert(0, {"kind": "path_exists", "path": destination, "is_dir": False})
+        sheet = _goal_sheet_name(goal_text)
+        if sheet and not any(a.get("kind") == "xlsx_sheet_exists" for a in candidate_checks):
+            candidate_checks.append({"kind": "xlsx_sheet_exists", "path": destination, "sheet": sheet})
+        subgoals[:] = [{
+            "id": 0,
+            "capability": "sheet",
+            "instruction": goal_text,
+            "expected_output": f"A new workbook {destination} is created with the requested data and sheet structure.",
+            "check_spec": {"checks": candidate_checks,
+                           "rationale": "Verify that the requested workbook and sheet were created."},
+        }]
+        changes.append({"workflow": "create_xlsx", "destination": destination,
+                        "action": "routed_files_only_plan_to_sheet_worker"})
+
+    # The planner may correctly create a Sheet subgoal but also split workbook
+    # creation into Files scaffolding steps (mkdir + write_text("<xlsx>..."));
+    # those steps corrupt the output before the Sheet worker can create it.
+    # For a new workbook, let xlsx_write create the parent directory and file.
+    if is_xlsx_creation and any(sg.get("capability") == "sheet" for sg in subgoals):
+        destination = xlsx_paths[-1]
+        destination_key = _norm_path(destination)
+        destination_name = PurePosixPath(destination.replace("\\", "/")).name.casefold()
+        destination_parent = PurePosixPath(destination.replace("\\", "/")).parent.as_posix()
+        parent_key = _norm_path(destination_parent)
+
+        def is_destination(candidate: Any) -> bool:
+            if not isinstance(candidate, str) or not candidate.strip():
+                return False
+            key = _norm_path(candidate)
+            return key == destination_key or key.endswith("/" + destination_name) or key == destination_name
+
+        sheet_targets = []
+        for candidate in subgoals:
+            if candidate.get("capability") != "sheet":
+                continue
+            mentions_target = any(is_destination(p) for p in _workbooks_of(candidate))
+            if not mentions_target:
+                text_fields = " ".join(str(candidate.get(k, "")) for k in ("instruction", "expected_output"))
+                mentions_target = bool(re.search(rf"(?<![\w]){re.escape(destination_name)}(?![\w])", text_fields, re.IGNORECASE))
+            if mentions_target:
+                sheet_targets.append(candidate)
+
+        if sheet_targets:
+            target = sheet_targets[0]
+            target_spec = target.setdefault("check_spec", {"checks": [], "rationale": "Verify the workbook result."})
+            target_checks = target_spec.setdefault("checks", [])
+            kept = []
+            removed = []
+
+            for candidate in subgoals:
+                if candidate in sheet_targets or candidate.get("capability") != "files":
+                    kept.append(candidate)
+                    continue
+
+                description = " ".join(str(candidate.get(k, "")) for k in ("instruction", "expected_output"))
+                assertions = _assertions_of(candidate)
+                referenced_paths = [a.get("path") for a in assertions if isinstance(a.get("path"), str)]
+                mentions_destination = (
+                    any(is_destination(p) for p in referenced_paths)
+                    or bool(re.search(rf"(?<![\w]){re.escape(destination_name)}(?![\w])", description, re.IGNORECASE))
+                )
+                is_file_transfer = bool(re.search(
+                    r"\b(copy|copied|copying|move|moved|moving|rename|renamed|renaming|duplicate|duplicated)\b",
+                    description, re.IGNORECASE,
+                ))
+
+                if mentions_destination and not is_file_transfer:
+                    # Preserve any useful postconditions, but run them after the
+                    # Sheet worker creates the actual workbook.
+                    for assertion in assertions:
+                        kind = assertion.get("kind")
+                        if (kind == "path_exists" and is_destination(assertion.get("path"))) or (
+                            isinstance(kind, str) and kind.startswith("xlsx_")
+                            and is_destination(assertion.get("path"))
+                        ):
+                            copied = dict(assertion)
+                            if copied not in target_checks:
+                                target_checks.append(copied)
+                    removed.append({"subgoal_id": candidate.get("id"), "reason": "Files subgoal attempted to create workbook content"})
+                    continue
+
+                # Creating a workbook also creates its parent directories. Move
+                # that directory postcondition onto the Sheet subgoal and drop
+                # the redundant Files mkdir step.
+                parent_assertions = [
+                    a for a in assertions
+                    if a.get("kind") == "path_exists"
+                    and a.get("is_dir") is True
+                    and isinstance(a.get("path"), str)
+                    and _norm_path(a["path"]) == parent_key
+                ]
+                if parent_assertions:
+                    for assertion in parent_assertions:
+                        copied = dict(assertion)
+                        if copied not in target_checks:
+                            target_checks.append(copied)
+                    removed.append({"subgoal_id": candidate.get("id"), "reason": "parent directory is created by xlsx_write"})
+                    continue
+
+                kept.append(candidate)
+
+            if removed:
+                subgoals[:] = kept
+                for index, item in enumerate(subgoals):
+                    item["id"] = index
+                changes.append({
+                    "workflow": "create_xlsx",
+                    "destination": destination,
+                    "action": "removed_files_scaffolding_before_sheet_creation",
+                    "removed": removed,
+                })
+
     return changes

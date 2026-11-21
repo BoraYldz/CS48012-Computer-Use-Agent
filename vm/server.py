@@ -175,6 +175,11 @@ def read_text(path: str, max_chars: int = 20000) -> str:
 def write_text(path: str, content: str) -> str:
     """Write a text file, creating parent folders."""
     p = _p(path)
+    if p.suffix.casefold() in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        raise ValueError(
+            f"Refusing to write plain text to Excel workbook path {path!r}. "
+            "Use xlsx_write or another spreadsheet tool to create or modify a workbook."
+        )
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return "ok"
@@ -207,6 +212,12 @@ def xlsx_read(path: str, sheet: str | None = None, cell_range: str | None = None
     """Read cells as rows of COMPUTED values (formulas are evaluated). Optional cell_range like "A1:D20";
     formulas=true returns the formula text instead. At most max_rows rows; check `truncated`."""
     return _json_text(sheet_tools.read(_xlsx(path), sheet, cell_range, max_rows, formulas))
+
+
+@mcp.tool()
+def xlsx_import_csv(csv_path: str, path: str, sheet: str = "Sheet1") -> str:
+    """Create a new XLSX workbook by importing every row from a CSV; numeric data cells become numbers."""
+    return sheet_tools.import_csv(_p(csv_path), _p(path), sheet)
 
 
 @mcp.tool()
@@ -252,6 +263,23 @@ def xlsx_append_rows(path: str, sheet: str, rows: list[list]) -> str:
 def xlsx_set_cells(path: str, sheet: str, cells: dict) -> str:
     """Set specific cells, e.g. {"B3": 99, "D2": "=B2*C2"}. Returns each cell's old -> new value."""
     return sheet_tools.set_cells(_p(path), sheet, cells)
+
+
+@mcp.tool()
+def xlsx_update_row(path: str, sheet: str, match_column: str,
+                    match_value: str | int | float, updates: dict) -> str:
+    """Update columns in exactly one row selected by its label/value, e.g. Item=Coffee -> Price=25."""
+    return sheet_tools.update_row_by_value(_xlsx(path), sheet, match_column, match_value, updates)
+
+
+@mcp.tool()
+def xlsx_add_formula_column(path: str, sheet: str, column: str, header: str,
+                            formula_template: str, first_data_row: int = 2,
+                            last_data_row: int | None = None) -> str:
+    """Add a formula column using a template such as =B{row}+C{row}, without changing other cells."""
+    return sheet_tools.add_formula_column(
+        _xlsx(path), sheet, column, header, formula_template, first_data_row, last_data_row
+    )
 
 
 # ---------- harness only (test setup / checkers); never given to workers ----------

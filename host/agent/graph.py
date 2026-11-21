@@ -3,7 +3,10 @@
 Subgoals run in order. A bounded Quick Fix is allowed only after new deterministic
 failure evidence; worker self-reports are never accepted as verification.
 """
+import asyncio
 import json
+import os
+import time
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
@@ -19,12 +22,14 @@ from .plan_validation import (
     add_empty_directory_postcondition,
     anchor_sheet_paths_to_goal,
     normalize_sheet_checks,
+    normalize_spreadsheet_workflows,
     consolidate_sheet_subgoals,
     execute_bound_move,
     normalize_bare_empty_globs,
     deduplicate_file_move_assertions,
     normalize_empty_directory_destinations,
     normalize_file_sort_assertions,
+    build_deterministic_file_sort_plan,
     normalize_glob_move_checks,
     strengthen_directory_inventory_checks,
     normalize_plan_check_specs,
@@ -60,6 +65,7 @@ Break the user's request into a short ordered list of concrete subgoals (usually
 Each subgoal goes to ONE specialist worker:
 - files: list, create, move, rename, copy, DELETE files and folders; read text and PDF files (deletion needs human approval; plan it only when the user explicitly asked for it)
 - sheet: inspect, create, append to, edit and compute in .xlsx workbooks (totals, averages, filtering, sorting, grouping, formulas); it can also read text/CSV/PDF files as input data. It cannot copy, move or delete files: copying a workbook is a files subgoal that must come BEFORE the sheet subgoal that edits the copy.
+A workbook file (.xlsx, .xlsm, .xltx or .xltm) is binary, not a text file: NEVER create or modify workbook contents with Files tools such as write_text. Route all workbook-content creation and edits to the Sheet worker. Files may copy, move or rename existing workbook files when requested.
 {PLANNER_ROOT_GUIDANCE}
 Keep subgoals concrete and checkable. Do not invent files that were not mentioned.
 If the user requires a source folder to be empty, never create the destination/organized folder inside that source folder; place the destination beside it or elsewhere so the source can become completely empty.
@@ -82,8 +88,8 @@ Use ONLY these deterministic assertion forms:
 - {{"kind":"xlsx_cell_equals", "path":"...xlsx", "sheet":"optional", "cell":"B7", "value":123.5, "tolerance":0.005}}  (only for a value stated in the request)
 - {{"kind":"xlsx_formula_present", "path":"...xlsx", "sheet":"optional", "cell":"D2", "contains":"SUM(B2:C2)"}}  (only when the request explicitly asks for a formula)
 - {{"kind":"xlsx_data_row_count", "path":"...xlsx", "sheet":"optional", "count":5}}  (non-empty rows BELOW the header row)
-- {{"kind":"xlsx_group_aggregate_matches", "path":"...xlsx", "sheet":"result sheet", "source_path":"...xlsx", "source_sheet":"optional", "column":"Revenue", "group_by":"Region", "op":"sum|avg|min|max|count"}}  (one result row per group, e.g. total per region: the checker recomputes every group from the source; use it for any "per X" totals)
-- {{"kind":"xlsx_aggregate_matches", "path":"...xlsx", "sheet":"optional", "cell":"B2", "source_path":"...xlsx", "source_sheet":"optional", "column":"Revenue", "op":"sum|avg|min|max|count", "tolerance":0.005}}  (the checker itself recomputes the aggregate of the source column; use it whenever a number must be DERIVED from existing data, never guess the number)
+- {{"kind":"xlsx_group_aggregate_matches", "path":"...xlsx", "sheet":"result sheet", "source_path":"...xlsx", "source_sheet":"optional", "column":"Revenue", "group_by":"Region", "op":"sum"}}  (one result row per group; use exactly one operation value: sum for totals, avg for averages, min, max, or count; never copy a pipe-separated list)
+- {{"kind":"xlsx_aggregate_matches", "path":"...xlsx", "sheet":"optional", "cell":"B2", "source_path":"...xlsx", "source_sheet":"optional", "column":"Revenue", "op":"sum", "tolerance":0.005}}  (the checker recomputes the source aggregate; set op to exactly one value: sum, avg, min, max, or count; never copy a pipe-separated list)
 All assertions in a check_spec are AND conditions. Checks are POSTCONDITIONS evaluated AFTER the worker finishes. For a created folder or file,
 verify path_exists (with is_dir=true for folders, false for files), never path_absent.
 Use path_absent only when the requested final result is that an item was deleted or moved away.
@@ -115,11 +121,14 @@ SHEET_WORKER_PROMPT = """You are the spreadsheet specialist worker of a desktop 
 {root_guidance}
 Workflow: (1) xlsx_info shows sheets, header rows and sizes (an overview may already be in the task message). (2) xlsx_read a bounded cell_range only where you need values. (3) Make the change with exactly the right write tool. (4) Re-read the cells you changed with xlsx_read and confirm they hold what you intended.
 Choose the write tool by intent:
-- new workbook or new sheet -> xlsx_write
+- CSV to a new XLSX workbook -> xlsx_import_csv with the exact CSV source path, output path and requested sheet name. It imports every row and types numeric data cells; NEVER reconstruct CSV rows manually.
+- new workbook or new sheet from specified rows -> xlsx_write
+- change a value identified by a row label (for example, the Price for Item=Coffee) -> xlsx_update_row with the exact match column/value and updated column/value. It requires exactly one matching row; do not guess cell addresses.
+- add a formula column to an existing table -> xlsx_add_formula_column with the new column letter, header and a formula template using {{row}}, for example =B{{row}}+C{{row}}. It determines the data extent and refuses to overwrite a non-empty target column.
 - total / average / count / min / max PER GROUP into a sheet ("revenue per region") -> xlsx_group_summary: it computes and writes the table in one call, sorted A-Z; never type such numbers yourself
 - add rows to a table that already exists -> xlsx_append_rows (never xlsx_write: it would replace the sheet)
-- change specific cells, or add a column / fill a formula down existing rows -> xlsx_set_cells with one entry per cell (header cell and every row, e.g. {{"D1":"Total","D2":"=B2+C2","D3":"=B3+C3"}}). NEVER use xlsx_append_rows for that: it adds new rows at the bottom
-- replace the whole contents of an existing sheet -> xlsx_write with replace_sheet=true; this destroys data and needs human approval, so do it only when the subgoal explicitly says to replace or overwrite. If a tool returns DENIED, stop immediately and report it; do not retry or work around it.
+- change specific cells whose addresses are explicitly known -> xlsx_set_cells. For row labels or a new formula column, prefer the dedicated tools above. NEVER use xlsx_append_rows to add a column: it adds new rows at the bottom.
+- replace the whole contents of an existing sheet -> xlsx_write with replace_sheet=true; this destroys data and needs human approval, so do it only when the subgoal explicitly says to replace or overwrite. Never use xlsx_write with replace_sheet=false to append to an existing sheet; it refuses that ambiguous operation. Use xlsx_append_rows or xlsx_set_cells instead. If a tool returns DENIED, stop immediately and report it; do not retry or work around it.
 Never add up, average, count, filter or sort numbers in your head and never invent values: use xlsx_aggregate (sum/avg/min/max/count, optional where/group_by) and xlsx_query (where/order_by/columns), then write the returned numbers.
 Data rules: write numbers as JSON numbers, not strings (42, not "42"; the tools also convert clean numeric text automatically); the header goes in row 1; reuse the exact sheet names and header text given in the task. Write a formula (a string starting with "=", for example "=SUM(B2:B6)") only when the subgoal asks for formulas; otherwise write plain values. Supported formula functions: SUM, AVERAGE, MIN, MAX, COUNT, ROUND, ABS, IF, AND, OR, NOT; operators + - * / ^ &. xlsx_read computes formulas for you.
 Never modify a sheet, cell or file you were not asked to change; workbooks you only read from are read-only inputs and sheets not named in the subgoal must stay untouched.
@@ -240,6 +249,56 @@ class _WorkerTraceHandler(BaseCallbackHandler):
         self._safe_log("step", **record)
 
 
+async def _invoke_planner_with_diagnostics(llm, goal: str, log: RunLog):
+    """Invoke the planner with visible heartbeats and a configurable hard timeout."""
+    timeout_seconds = max(30.0, float(os.getenv("PLANNER_TIMEOUT_SECONDS", "420")))
+    heartbeat_seconds = max(5.0, float(os.getenv("PLANNER_HEARTBEAT_SECONDS", "30")))
+    started = time.monotonic()
+    task = asyncio.create_task(
+        llm.ainvoke([("system", PLANNER_PROMPT), ("user", goal)])
+    )
+    log.write(
+        "planner_start",
+        model=os.getenv("PLANNER_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b")),
+        prompt_chars=len(PLANNER_PROMPT),
+        goal_chars=len(goal),
+        timeout_seconds=timeout_seconds,
+    )
+
+    while True:
+        elapsed = time.monotonic() - started
+        remaining = timeout_seconds - elapsed
+        if remaining <= 0:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            log.write("planner_timeout", elapsed_seconds=round(elapsed, 1),
+                      timeout_seconds=timeout_seconds)
+            raise TimeoutError(
+                f"Planner did not return within {timeout_seconds:g} seconds; "
+                "see planner_start/planner_wait events for diagnostics."
+            )
+
+        done, _ = await asyncio.wait(
+            {task}, timeout=min(heartbeat_seconds, remaining)
+        )
+        if not done:
+            log.write("planner_wait", elapsed_seconds=round(time.monotonic() - started, 1),
+                      remaining_seconds=round(max(0.0, timeout_seconds - (time.monotonic() - started)), 1))
+            continue
+
+        try:
+            result = task.result()
+        except Exception as exc:
+            log.write("planner_error", elapsed_seconds=round(time.monotonic() - started, 1),
+                      error=f"{type(exc).__name__}: {str(exc)[:300]}")
+            raise
+
+        log.write("planner_end", elapsed_seconds=round(time.monotonic() - started, 1),
+                  raw_tokens=_tokens(result.get("raw")) if isinstance(result, dict) else 0,
+                  parsed=bool(result.get("parsed")) if isinstance(result, dict) else False)
+        return result
+
+
 def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None = None):
 
     async def plan(state: AgentState):
@@ -256,22 +315,39 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
             log.write("plan", source="task_fixture", subgoals=subgoals)
             return {"subgoals": subgoals, "current": 0}
 
-        llm = model("planner").with_structured_output(Plan, include_raw=True)
-        out = await llm.ainvoke([("system", PLANNER_PROMPT), ("user", state["goal"])])
-        parsed: Plan | None = out["parsed"]
-        # Validate the planner's output before granting any worker access.
-        if parsed is None or not parsed.subgoals:
-            raise ValueError(f"planner returned no valid plan: {out.get('parsing_error')}")
-        bad = [s.capability for s in parsed.subgoals if s.capability not in WORKER_TOOLS]
-        if bad:
-            raise ValueError(f"planner used unknown capabilities: {bad}")
-        subgoals = [{"id": i, **s.model_dump()} for i, s in enumerate(parsed.subgoals)]
+        # Explicit extension-to-folder sorting with an empty-source postcondition is
+        # sufficiently specified to plan deterministically. Avoid a costly LLM planner
+        # call for this narrow workflow; exact file manifests are still captured below.
+        subgoals = build_deterministic_file_sort_plan(state["goal"])
+        planner_tokens = 0
+        if subgoals is not None:
+            log.write(
+                "plan_deterministic_file_workflow",
+                workflow="extension_sort",
+                subgoals=len(subgoals),
+                reason="explicit source, output folder, extension mappings, and empty-source requirement",
+            )
+        else:
+            llm = model("planner").with_structured_output(Plan, include_raw=True)
+            out = await _invoke_planner_with_diagnostics(llm, state["goal"], log)
+            parsed: Plan | None = out["parsed"]
+            # Validate the planner's output before granting any worker access.
+            if parsed is None or not parsed.subgoals:
+                raise ValueError(f"planner returned no valid plan: {out.get('parsing_error')}")
+            bad = [s.capability for s in parsed.subgoals if s.capability not in WORKER_TOOLS]
+            if bad:
+                raise ValueError(f"planner used unknown capabilities: {bad}")
+            subgoals = [{"id": i, **s.model_dump()} for i, s in enumerate(parsed.subgoals)]
+            planner_tokens = _tokens(out["raw"])
         # Check specs are postconditions. Correct an unambiguous planner error
         # before any worker acts: creation targets must exist after creation,
         # and path_absent cannot coexist with a positive assertion for the same path.
         check_repairs = normalize_plan_check_specs(subgoals)
         if check_repairs:
             log.write("plan_check_normalization", changes=check_repairs)
+        workflow_changes = normalize_spreadsheet_workflows(state["goal"], subgoals)
+        if workflow_changes:
+            log.write("plan_spreadsheet_workflow_normalization", changes=workflow_changes)
         # Preserve explicit destination context in machine-checkable paths.
         # This prevents a planner omission from making the checker validate
         # the wrong location (e.g. Proje/ instead of Desktop/Proje/).
@@ -334,7 +410,7 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
 
         log.write("plan", subgoals=subgoals)
         return {"subgoals": subgoals, "current": 0,
-                "tokens_used": state.get("tokens_used", 0) + _tokens(out["raw"])}
+                "tokens_used": state.get("tokens_used", 0) + planner_tokens}
 
     async def worker(state: AgentState):
         sg = state["subgoals"][state["current"]]
@@ -363,10 +439,10 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
         for assertion in spec.get("checks", []) if isinstance(spec, dict) else []:
             if (isinstance(assertion, dict) and isinstance(assertion.get("path"), str)
                     and assertion.get("kind") in {
-                        "path_exists", "path_absent", "text_contains", "text_equals",
+                        "path_exists", "path_absent", "file_content_matches", "text_contains", "text_equals",
                         "xlsx_sheet_exists", "xlsx_values_present", "xlsx_rows_present",
                         "xlsx_cell_equals", "xlsx_formula_present", "xlsx_data_row_count",
-                        "xlsx_aggregate_matches", "xlsx_group_aggregate_matches",
+                        "xlsx_aggregate_matches", "xlsx_group_aggregate_matches", "xlsx_csv_matches",
                     }):
                 required_paths.append(assertion["path"])
             if isinstance(assertion, dict) and isinstance(assertion.get("source_path"), str):
@@ -568,18 +644,38 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
         if state.get("tokens_used", 0) > MAX_TOKENS:
             return {"checks": checks, "quick_fix_pending": False, "status": "stopped"}
 
-        if result["status"] == "unknown":
-            return {"checks": checks, "quick_fix_pending": False,
-                    "repair_instruction": "", "status": "unknown"}
-
-        if result["status"] == "fail" and any(
-                s.get("subgoal_id") == sg["id"] and "DENIED:" in str(s.get("observation", ""))
-                for s in state.get("history", [])):
+        denied = any(
+            s.get("subgoal_id") == sg["id"] and "DENIED:" in str(s.get("observation", ""))
+            for s in state.get("history", [])
+        )
+        if denied:
+            # A denial is final even when a weak/partial postcondition happens to pass.
             log.write("quick_fix_blocked", subgoal=sg["id"], attempts=attempts,
                       reason="human denied approval; a denial is final, not a fault to repair")
             return {"checks": checks, "quick_fix_pending": False, "repair_instruction": "", "status": "failed"}
 
+        if result["status"] == "unknown":
+            return {"checks": checks, "quick_fix_pending": False,
+                    "repair_instruction": "", "status": "unknown"}
+
         if result["status"] == "fail":
+            missing_sources = []
+            for assertion in (sg.get("check_spec") or {}).get("checks", []):
+                source = assertion.get("source_path") if isinstance(assertion, dict) else None
+                if not isinstance(source, str) or not source:
+                    continue
+                try:
+                    source_info = await vm.call("path_info", path=source)
+                except Exception:
+                    source_info = {"exists": False}
+                if not isinstance(source_info, dict) or not source_info.get("exists"):
+                    missing_sources.append(source)
+            if missing_sources:
+                log.write("quick_fix_blocked", subgoal=sg["id"], attempts=attempts,
+                          reason=f"required source input is missing: {sorted(set(missing_sources))}")
+                return {"checks": checks, "quick_fix_pending": False,
+                        "repair_instruction": "", "status": "failed"}
+
             evidence = result.get("evidence", "")
             is_new_evidence = bool(evidence) and evidence != last_evidence
             steps_used = state.get("step_counts", {}).get(key, 0)

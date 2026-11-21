@@ -16,8 +16,10 @@ Design points
 """
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import hashlib
+import io
 import json
 import math
 import re
@@ -341,8 +343,11 @@ class _Book:
         key = (sheet, coord)
         if key in self._memo:
             return self._memo[key]
-        raw = self.wf[sheet][coord].value
-        if _is_formula(raw):
+        cell = self.wf[sheet][coord]
+        raw = cell.value
+        # A CSV/text value beginning with '=' is still data when the importer
+        # explicitly stored it as a string. Only evaluate genuine XLSX formulas.
+        if _is_formula(raw) and cell.data_type == "f":
             cached = self.wv[sheet][coord].value
             if cached is not None:
                 v = cached
@@ -600,17 +605,28 @@ def write(path: Path, rows: list[list], sheet: str = "Sheet1", replace_sheet: bo
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         wb = load_workbook(path)
-        if sheet in wb.sheetnames and replace_sheet:
-            idx = wb.sheetnames.index(sheet)
-            del wb[sheet]
-            ws = wb.create_sheet(sheet, idx)          # keep the sheet's position
+        if sheet in wb.sheetnames:
+            existing_rows = _used_rows(wb[sheet])
+            if existing_rows and not replace_sheet:
+                wb.close()
+                raise FileExistsError(
+                    f"sheet {sheet!r} already contains {existing_rows} row(s); "
+                    "xlsx_write with replace_sheet=False will not append or modify it. "
+                    "Use xlsx_set_cells to edit cells or xlsx_append_rows to append rows."
+                )
+            if replace_sheet:
+                idx = wb.sheetnames.index(sheet)
+                del wb[sheet]
+                ws = wb.create_sheet(sheet, idx)      # keep the sheet's position
+            else:
+                ws = wb[sheet]                         # existing but empty
         else:
-            ws = wb[sheet] if sheet in wb.sheetnames else wb.create_sheet(sheet)
+            ws = wb.create_sheet(sheet)
     else:
         wb = Workbook()
         ws = wb.active
         ws.title = sheet
-    start = _used_rows(ws)                              # 0 for a new/replaced sheet, else append below
+    start = 0                                           # write starts at A1; append has its own tool
     for offset, r in enumerate(rows, start=1):
         for c, v in enumerate(r, start=1):
             ws.cell(start + offset, c, v)
@@ -679,6 +695,146 @@ def set_cells(path: Path, sheet: str, cells: dict[str, Any]) -> str:
         wb.save(path)
         shown = "; ".join(changes[:20]) + (f"; … +{len(changes) - 20} more" if len(changes) > 20 else "")
         return f"set {len(changes)} cell(s) in {sheet}: {shown}{_note(converted)}"
+    finally:
+        wb.close()
+
+
+def import_csv(csv_path: Path, output_path: Path, sheet: str = "Sheet1") -> str:
+    """Import a CSV as a new one-sheet workbook, preserving rows and typing numeric data cells."""
+    _check_sheet_name(sheet)
+    csv_path, output_path = Path(csv_path), Path(output_path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"CSV source does not exist: {csv_path}")
+    if output_path.exists():
+        raise FileExistsError(f"destination workbook already exists: {output_path}")
+    if csv_path.resolve() == output_path.resolve():
+        raise ValueError("CSV source and XLSX destination must be different files")
+
+    rows: list[list[Any]] = []
+    converted = 0
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+        content = stream.read()
+    try:
+        dialect = csv.Sniffer().sniff(content[:8192], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    for row_index, raw_row in enumerate(csv.reader(io.StringIO(content), dialect)):
+        row: list[Any] = []
+        for raw in raw_row:
+            if raw == "":
+                row.append(None)
+            elif row_index == 0:
+                # Header labels are text even when they look numeric.
+                row.append(raw)
+            else:
+                value, changed = coerce_number(raw)
+                converted += int(changed)
+                row.append(value)
+        rows.append(row)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet
+    for r, values in enumerate(rows, start=1):
+        for c, value in enumerate(values, start=1):
+            cell = ws.cell(r, c, value)
+            # Prevent CSV data such as '=HYPERLINK(...)' from becoming a formula.
+            if isinstance(value, str) and value.startswith("="):
+                cell.data_type = "s"
+    wb.save(output_path)
+    wb.close()
+    return (f"imported {len(rows)} CSV row(s) to {output_path.name}!{sheet} "
+            f"({converted} numeric data value(s) converted)")
+
+
+def update_row_by_value(path: Path, sheet: str, match_column: str,
+                        match_value: Any, updates: dict[str, Any]) -> str:
+    """Update columns in exactly one row selected by an exact header/value match."""
+    if not isinstance(updates, dict) or not updates:
+        raise ValueError("updates must map one or more column headers to new values")
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"workbook does not exist: {Path(path).name}")
+    match_value, _ = coerce_number(match_value)
+    wb = load_workbook(path)
+    try:
+        if sheet not in wb.sheetnames:
+            raise KeyError(f"worksheet not found: {sheet!r}; available sheets: {wb.sheetnames}")
+        ws = wb[sheet]
+        header = [ws.cell(1, col).value for col in range(1, max(ws.max_column, 1) + 1)]
+        match_idx = _col(header, match_column) + 1
+        update_cols = { _col(header, name) + 1: value for name, value in updates.items() }
+        if len(update_cols) != len(updates):
+            raise ValueError("updates resolve to duplicate columns")
+
+        def equal(actual: Any, expected: Any) -> bool:
+            if _isnum(actual) and _isnum(expected):
+                return float(actual) == float(expected)
+            if isinstance(actual, str) and isinstance(expected, str):
+                return actual.strip().casefold() == expected.strip().casefold()
+            return actual == expected
+
+        matches = [r for r in range(2, _used_rows(ws) + 1)
+                   if equal(ws.cell(r, match_idx).value, match_value)]
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected exactly one row where {match_column!r}={match_value!r}; found {len(matches)}"
+            )
+
+        row = matches[0]
+        changes, converted = [], 0
+        for col, raw_value in update_cols.items():
+            value, hit = coerce_number(raw_value)
+            converted += int(hit)
+            cell = ws.cell(row, col)
+            changes.append(f"{cell.coordinate}: {cell.value!r} -> {value!r}")
+            cell.value = value
+        wb.save(path)
+        return f"updated row {row} in {sheet}: " + "; ".join(changes) + _note(converted)
+    finally:
+        wb.close()
+
+
+def add_formula_column(path: Path, sheet: str, column: str, header: str,
+                       formula_template: str, first_data_row: int = 2,
+                       last_data_row: int | None = None) -> str:
+    """Add a new empty column and fill formulas using a {row} template, without touching other cells."""
+    if not re.fullmatch(r"[A-Za-z]{1,3}", column or ""):
+        raise ValueError("column must be a column letter such as D")
+    if not isinstance(header, str) or not header.strip():
+        raise ValueError("header must be non-empty text")
+    if not isinstance(formula_template, str) or not formula_template.startswith("=") or "{row}" not in formula_template:
+        raise ValueError("formula_template must start with '=' and contain the {row} placeholder")
+    if first_data_row < 2:
+        raise ValueError("first_data_row must be 2 or greater")
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"workbook does not exist: {Path(path).name}")
+
+    target_col = column_index_from_string(column.upper())
+    wb = load_workbook(path)
+    try:
+        if sheet not in wb.sheetnames:
+            raise KeyError(f"worksheet not found: {sheet!r}; available sheets: {wb.sheetnames}")
+        ws = wb[sheet]
+        last = _used_rows(ws) if last_data_row is None else last_data_row
+        if last < first_data_row - 1:
+            raise ValueError("no data rows found for the requested formula column")
+        occupied = [ws.cell(r, target_col).coordinate for r in range(1, last + 1)
+                    if ws.cell(r, target_col).value not in (None, "")]
+        if occupied:
+            raise ValueError(f"target column {column.upper()} is not empty; refusing to overwrite {occupied[:8]}")
+
+        ws.cell(1, target_col, header)
+        written = 0
+        for row in range(first_data_row, last + 1):
+            if not any(ws.cell(row, col).value not in (None, "")
+                       for col in range(1, target_col)):
+                continue
+            formula = formula_template.replace("{row}", str(row))
+            ws.cell(row, target_col, formula)
+            written += 1
+        wb.save(path)
+        return f"created {column.upper()} ({header}) and wrote {written} formula(s) in {sheet}"
     finally:
         wb.close()
 

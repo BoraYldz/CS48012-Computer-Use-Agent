@@ -25,7 +25,7 @@ _PATH_ASSERTION_KINDS = {
     "xlsx_cell_equals",
     "xlsx_formula_present",
     "xlsx_data_row_count",
-    "xlsx_aggregate_matches", "xlsx_group_aggregate_matches",
+    "xlsx_aggregate_matches", "xlsx_group_aggregate_matches", "xlsx_csv_matches", "file_content_matches",
 }
 
 

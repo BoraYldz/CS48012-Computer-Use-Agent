@@ -42,8 +42,10 @@ def named_workbooks(subgoal: dict[str, Any]) -> dict[str, set[str | None]]:
 
 
 def source_workbooks(subgoal: dict[str, Any]) -> set[str]:
+    """Return only XLSX inputs; CSV/text sources are not openpyxl workbooks."""
     return {a["source_path"] for a in _assertions(subgoal)
-            if isinstance(a.get("source_path"), str) and a["source_path"]}
+            if isinstance(a.get("source_path"), str)
+            and a["source_path"].casefold().endswith((".xlsx", ".xlsm", ".xltx", ".xltm"))}
 
 
 async def _sheet_digests(vm, path: str, names: list[str]) -> dict[str, str]:

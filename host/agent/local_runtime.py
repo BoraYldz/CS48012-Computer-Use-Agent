@@ -119,12 +119,15 @@ class LocalVM:
             "read_pdf_text": self.read_pdf_text,
             "xlsx_info": self.xlsx_info,
             "xlsx_read": self.xlsx_read,
+            "xlsx_import_csv": self.xlsx_import_csv,
             "xlsx_query": self.xlsx_query,
             "xlsx_aggregate": self.xlsx_aggregate,
             "xlsx_group_summary": self.xlsx_group_summary,
             "xlsx_write": self.xlsx_write,
             "xlsx_append_rows": self.xlsx_append_rows,
             "xlsx_set_cells": self.xlsx_set_cells,
+            "xlsx_update_row": self.xlsx_update_row,
+            "xlsx_add_formula_column": self.xlsx_add_formula_column,
             # Harness-only tools: intentionally absent from WORKER_TOOLS.
             "harness_put_file": self.harness_put_file,
             "harness_get_file": self.harness_get_file,
@@ -317,6 +320,11 @@ class LocalVM:
     def write_text(self, path: str, content: str) -> str:
         """Write a UTF-8 text file, creating parent folders when needed."""
         p = self._p(path)
+        if p.suffix.casefold() in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+            raise ValueError(
+                f"Refusing to write plain text to Excel workbook path {path!r}. "
+                "Use xlsx_write or another spreadsheet tool to create or modify a workbook."
+            )
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         fault = self._write_fault
@@ -341,6 +349,10 @@ class LocalVM:
         """Read cells as rows of COMPUTED values (formulas are evaluated). Optional cell_range like "A1:D20";
         formulas=true returns the formula text instead. At most max_rows rows; check `truncated`."""
         return sheet_tools.read(self._existing_xlsx(path), sheet, cell_range, max_rows, formulas)
+
+    def xlsx_import_csv(self, csv_path: str, path: str, sheet: str = "Sheet1") -> str:
+        """Create a new one-sheet workbook from a CSV, preserving every row and converting numeric data cells."""
+        return sheet_tools.import_csv(self._p(csv_path), self._p(path), sheet)
 
     def xlsx_query(self, path: str, sheet: str | None = None, where: list[dict] | None = None,
                    order_by: str | None = None, descending: bool = False,
@@ -401,6 +413,20 @@ class LocalVM:
     def xlsx_set_cells(self, path: str, sheet: str, cells: dict[str, Any]) -> str:
         """Set specific cells, e.g. {"B3": 99, "D2": "=B2*C2"}. Returns each cell's old -> new value."""
         return sheet_tools.set_cells(self._p(path), sheet, cells)
+
+    def xlsx_update_row(self, path: str, sheet: str, match_column: str,
+                        match_value: Any, updates: dict[str, Any]) -> str:
+        """Update columns in exactly one row selected by a header and its value, e.g. Item=Coffee -> Price=25."""
+        return sheet_tools.update_row_by_value(self._existing_xlsx(path), sheet, match_column, match_value, updates)
+
+    def xlsx_add_formula_column(self, path: str, sheet: str, column: str, header: str,
+                                formula_template: str, first_data_row: int = 2,
+                                last_data_row: int | None = None) -> str:
+        """Add a new empty column and fill it with formulas using a template such as =B{row}+C{row}."""
+        return sheet_tools.add_formula_column(
+            self._existing_xlsx(path), sheet, column, header, formula_template,
+            first_data_row, last_data_row,
+        )
 
     def _existing_xlsx(self, path: str) -> Path:
         p = self._p(path)
