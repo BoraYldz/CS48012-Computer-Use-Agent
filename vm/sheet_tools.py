@@ -289,6 +289,34 @@ def _jsonable(v: Any, limit: int = 300) -> Any:
     return v
 
 
+_NUMERIC_TEXT = re.compile(r"^-?(?:0|[1-9]\d{0,14})(?:\.\d+)?$")
+
+
+def coerce_number(v: Any) -> tuple[Any, bool]:
+    """Canonical numeric text ("42", "-3.5") -> number. Leading zeros ("007"), dates, phone-like
+    or >15-digit strings stay text. Small models often quote numbers; this keeps columns numeric."""
+    if isinstance(v, str) and _NUMERIC_TEXT.match(v.strip()):
+        t = v.strip()
+        return (float(t) if "." in t else int(t)), True
+    return v, False
+
+
+def coerce_rows(rows: list[list]) -> tuple[list[list], int]:
+    out, n = [], 0
+    for r in rows:
+        new = []
+        for v in r:
+            v2, hit = coerce_number(v)
+            n += hit
+            new.append(v2)
+        out.append(new)
+    return out, n
+
+
+def _note(n: int) -> str:
+    return f" (converted {n} numeric-looking text value(s) to numbers)" if n else ""
+
+
 def _is_formula(raw: Any) -> bool:
     return isinstance(raw, str) and raw.startswith("=") and len(raw) > 1
 
@@ -568,6 +596,7 @@ def write(path: Path, rows: list[list], sheet: str = "Sheet1", replace_sheet: bo
     _check_sheet_name(sheet)
     if not isinstance(rows, list) or any(not isinstance(r, list) for r in rows):
         raise ValueError("rows must be a list of lists, e.g. [[\"Name\",\"Score\"],[\"A\",10]]")
+    rows, converted = coerce_rows(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         wb = load_workbook(path)
@@ -587,7 +616,19 @@ def write(path: Path, rows: list[list], sheet: str = "Sheet1", replace_sheet: bo
             ws.cell(start + offset, c, v)
     wb.save(path)
     wb.close()
-    return f"wrote {len(rows)} rows to {path.name}!{sheet}"
+    return f"wrote {len(rows)} rows to {path.name}!{sheet}{_note(converted)}"
+
+
+def summarize(path: Path, source_sheet: str | None, group_by: str, column: str, op: str,
+              target_sheet: str, replace_sheet: bool = True) -> str:
+    """Compute a per-group aggregate AND write it as a table (header, one row per group, A-Z)."""
+    agg = aggregate(path, source_sheet, column, op, None, group_by)
+    def key(k: str):
+        v, is_num = coerce_number(k)
+        return (0, float(v), "") if is_num else (1, 0.0, k.casefold())
+    rows = [[agg["group_by"], agg["column"]]] + [[k, agg["groups"][k]] for k in sorted(agg["groups"], key=key)]
+    msg = write(path, rows, target_sheet, replace_sheet)
+    return f"{msg}: {json.dumps(rows, ensure_ascii=False, default=str)}"
 
 
 def append_rows(path: Path, sheet: str, rows: list[list]) -> str:
@@ -596,6 +637,7 @@ def append_rows(path: Path, sheet: str, rows: list[list]) -> str:
         raise ValueError("rows must be a non-empty list of lists")
     if not path.is_file():
         raise FileNotFoundError(f"workbook does not exist: {path.name}. Use xlsx_write to create it.")
+    rows, converted = coerce_rows(rows)
     wb = load_workbook(path)
     try:
         if sheet not in wb.sheetnames:
@@ -607,7 +649,7 @@ def append_rows(path: Path, sheet: str, rows: list[list]) -> str:
             for c, v in enumerate(r, start=1):
                 ws.cell(first + offset, c, v)
         wb.save(path)
-        return f"appended {len(rows)} row(s) to {sheet} at rows {first}-{first + len(rows) - 1}"
+        return f"appended {len(rows)} row(s) to {sheet} at rows {first}-{first + len(rows) - 1}{_note(converted)}"
     finally:
         wb.close()
 
@@ -626,15 +668,17 @@ def set_cells(path: Path, sheet: str, cells: dict[str, Any]) -> str:
         if sheet not in wb.sheetnames:
             raise KeyError(f"worksheet not found: {sheet!r}; available sheets: {wb.sheetnames}")
         ws = wb[sheet]
-        changes = []
+        changes, converted = [], 0
         for addr, value in cells.items():
             addr = addr.upper()
+            value, hit = coerce_number(value)
+            converted += hit
             changes.append(f"{addr}: {json.dumps(_jsonable(ws[addr].value, 60), ensure_ascii=False)} -> "
                            f"{json.dumps(value, ensure_ascii=False, default=str)}")
             ws[addr] = value
         wb.save(path)
         shown = "; ".join(changes[:20]) + (f"; … +{len(changes) - 20} more" if len(changes) > 20 else "")
-        return f"set {len(changes)} cell(s) in {sheet}: {shown}"
+        return f"set {len(changes)} cell(s) in {sheet}: {shown}{_note(converted)}"
     finally:
         wb.close()
 

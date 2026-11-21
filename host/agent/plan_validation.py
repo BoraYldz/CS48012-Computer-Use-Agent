@@ -22,7 +22,7 @@ _DIRECTORY_WORDS = re.compile(r"\b(folder|directory|subfolder)\b", re.IGNORECASE
 _POSITIVE_KINDS = {
     "path_exists", "text_contains", "text_equals", "xlsx_sheet_exists",
     "xlsx_values_present", "xlsx_rows_present", "xlsx_cell_equals",
-    "xlsx_formula_present", "xlsx_data_row_count", "xlsx_aggregate_matches",
+    "xlsx_formula_present", "xlsx_data_row_count", "xlsx_aggregate_matches", "xlsx_group_aggregate_matches",
 }
 
 
@@ -818,3 +818,235 @@ async def snapshot_move_assertions(vm, subgoals: list[dict[str, Any]]) -> list[d
                     "error": assertion["snapshot_error"],
                 })
     return snapshots
+
+
+# ----------------------------------------------------------------- sheet plans
+_GOAL_PATH = re.compile(r"[^\s\"'`,;()<>]+\.[A-Za-z0-9]{2,5}\b")
+_NUMERIC_TEXT = re.compile(r"^-?(?:0|[1-9]\d{0,14})(?:\.\d+)?$")
+_AGGREGATE_WORDS = re.compile(r"\b(sum|total|totals|average|mean|minimum|maximum|min|max|count|number of)\b", re.IGNORECASE)
+
+
+def _assertions_of(subgoal: dict[str, Any]) -> list[dict[str, Any]]:
+    spec = subgoal.get("check_spec")
+    checks = spec.get("checks") if isinstance(spec, dict) else None
+    return [a for a in checks if isinstance(a, dict)] if isinstance(checks, list) else []
+
+
+def anchor_sheet_paths_to_goal(goal: str, subgoals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Restore the directory the user wrote. A small planner often shortens
+    `_eval/x/prices.xlsx` to `prices.xlsx`; the worker then looks in the wrong place and may invent
+    the file. If a sheet subgoal path is a suffix of exactly one path written in the goal, use the
+    goal's spelling (check_spec, instruction and expected_output)."""
+    seen: dict[str, set[str]] = {}
+    for token in _GOAL_PATH.findall(goal or ""):
+        token = token.rstrip(".")
+        if "/" in token:
+            seen.setdefault(PurePosixPath(token).name.casefold(), set()).add(token)
+    full = {name: next(iter(paths)) for name, paths in seen.items() if len(paths) == 1}
+    changes: list[dict[str, Any]] = []
+    for sg in subgoals:
+        if sg.get("capability") != "sheet":
+            continue
+        wanted: dict[str, str] = {}
+        for a in _assertions_of(sg):
+            for key in ("path", "source_path"):
+                v = a.get(key)
+                if not isinstance(v, str) or not v:
+                    continue
+                target = full.get(PurePosixPath(v.replace("\\", "/")).name.casefold())
+                if target and v != target and target.endswith("/" + v.replace("\\", "/").lstrip("./")):
+                    a[key] = target
+                    wanted[v] = target
+                    changes.append({"subgoal_id": sg.get("id"), "from": v, "to": target})
+        # The instruction may still say the bare name even when the check paths are already right
+        # (the worker then looks in the wrong folder and reports "file does not exist").
+        for name, target in full.items():
+            short = PurePosixPath(target).name
+            for field in ("instruction", "expected_output"):
+                if isinstance(sg.get(field), str):
+                    new_text = re.sub(rf"(?<![\w/.]){re.escape(short)}(?![\w])", target, sg[field])
+                    if new_text != sg[field]:
+                        sg[field] = new_text
+                        changes.append({"subgoal_id": sg.get("id"), "field": field, "bare_name": short, "to": target})
+        for short, target in wanted.items():
+            pattern = rf"(?<![\w/.]){re.escape(short)}(?![\w])"
+            for field in ("instruction", "expected_output"):
+                if isinstance(sg.get(field), str):
+                    sg[field] = re.sub(pattern, target, sg[field])
+    return changes
+
+
+_KIND_FIELDS = {
+    "xlsx_sheet_exists": {"path", "sheet"},
+    "xlsx_values_present": {"path", "sheet", "values"},
+    "xlsx_rows_present": {"path", "sheet", "rows"},
+    "xlsx_cell_equals": {"path", "sheet", "cell", "value", "tolerance"},
+    "xlsx_formula_present": {"path", "sheet", "cell", "contains"},
+    "xlsx_data_row_count": {"path", "sheet", "count"},
+    "xlsx_aggregate_matches": {"path", "sheet", "cell", "source_path", "source_sheet", "column", "op", "tolerance"},
+    "xlsx_group_aggregate_matches": {"path", "sheet", "source_path", "source_sheet", "column", "group_by", "op", "tolerance"},
+    "xlsx_sheets_preserved": {"path", "preserved_sheets"},
+}
+_NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+                 "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty"]
+
+
+def _count_in_request(count: Any, scope: str) -> bool:
+    try:
+        n = int(str(count).strip())
+    except ValueError:
+        return True                              # handled (dropped) by the integer rule later
+    words = [_NUMBER_WORDS[n]] if 0 <= n < len(_NUMBER_WORDS) else []
+    return any(re.search(rf"(?<![\w.]){re.escape(w)}(?![\w])", scope, re.IGNORECASE) for w in [str(n), *words])
+
+
+def _sanitize_sheet_assertion(a: dict[str, Any]) -> str | None:
+    """Keep only the fields that belong to the kind; remove placeholders copied from the prompt's
+    examples. Returns a reason when the assertion is unusable and must be dropped."""
+    allowed = _KIND_FIELDS.get(str(a.get("kind")))
+    if allowed is None:
+        return None
+    for key in list(a):
+        if key != "kind" and key not in allowed:
+            del a[key]
+    for key in ("sheet", "source_sheet"):
+        v = a.get(key)
+        if isinstance(v, str) and (not v.strip() or v.strip().lower().startswith("optional")):
+            a.pop(key)
+    for key in list(a):
+        if a[key] in ("", None):
+            a.pop(key)
+    if isinstance(a.get("tolerance"), (int, float)) and a["tolerance"] <= 0:
+        a.pop("tolerance")                    # 0.0 would demand bit-exact float equality
+    if "|" in str(a.get("op", "")):
+        return "op is the prompt placeholder, not a value"
+    if a.get("kind") == "xlsx_values_present" and not a.get("values"):
+        return "empty values list"
+    if a.get("kind") == "xlsx_rows_present" and not a.get("rows"):
+        return "empty rows list"
+    return None
+
+
+def normalize_sheet_checks(goal: str, subgoals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove spreadsheet assertions the request does not justify, and unify number typing.
+
+    * xlsx_formula_present      only when the request mentions a formula
+    * xlsx_cell_equals          only when the request names that cell address (the planner cannot
+                                know a file's layout, so a guessed address is a false failure)
+    * xlsx_aggregate_matches    only with a distinct source and an aggregate word in the request
+    * numeric-looking text in expected values becomes a number (same policy as the write tools)
+    """
+    changes: list[dict[str, Any]] = []
+    text = goal or ""
+    for sg in subgoals:
+        if sg.get("capability") != "sheet":
+            continue
+        scope = f"{text}\n{sg.get('instruction', '')}"
+        keep = []
+        downgraded: dict[tuple, list] = {}
+        spec = sg.get("check_spec")
+        for a in _assertions_of(sg):
+            kind, why = a.get("kind"), _sanitize_sheet_assertion(a)
+            if why:
+                pass
+            elif kind == "xlsx_data_row_count" and not _count_in_request(a.get("count"), scope):
+                why = "row count does not appear in the request (likely copied from the prompt example)"
+            elif kind == "xlsx_formula_present" and not re.search(r"formula|=\s*[A-Za-z(]", scope, re.IGNORECASE):
+                why = "request does not ask for a formula"
+            elif kind == "xlsx_cell_equals":
+                cell = str(a.get("cell") or "")
+                if not cell or not re.search(rf"(?<![A-Za-z0-9]){re.escape(cell)}(?![A-Za-z0-9])", scope, re.IGNORECASE):
+                    why = f"cell {cell!r} is not named in the request (planner cannot know the layout)"
+            elif kind in {"xlsx_aggregate_matches", "xlsx_group_aggregate_matches"}:
+                same = (a.get("source_path") == a.get("path")
+                        and (a.get("source_sheet") or None) == (a.get("sheet") or None))
+                if not a.get("source_path") or same or not _AGGREGATE_WORDS.search(scope):
+                    why = "no distinct source workbook/sheet or no aggregate requested"
+            if why:
+                changes.append({"subgoal_id": sg.get("id"), "dropped": kind, "reason": why})
+                # A guessed cell address cannot be trusted, but the VALUE the request promised still
+                # can: downgrade to "this value appears on the sheet" instead of leaving no check.
+                if kind == "xlsx_cell_equals" and a.get("value") is not None and a.get("path"):
+                    key = (a["path"], a.get("sheet") or None)
+                    downgraded.setdefault(key, []).append(a["value"])
+                continue
+            if kind == "xlsx_formula_present" and a.get("contains"):
+                spelled = re.sub(r"[\s$]", "", str(a["contains"])).upper()
+                if spelled not in re.sub(r"[\s$]", "", scope).upper():
+                    a.pop("contains")          # the request shows only an example; any correct formula is fine
+                    changes.append({"subgoal_id": sg.get("id"), "kind": kind, "dropped_field": "contains"})
+            if kind == "xlsx_data_row_count":
+                c = a.get("count")
+                if isinstance(c, str) and c.strip().isdigit():
+                    a["count"] = int(c.strip())
+                elif isinstance(c, float) and c.is_integer():
+                    a["count"] = int(c)
+                elif not isinstance(c, int) or isinstance(c, bool):
+                    changes.append({"subgoal_id": sg.get("id"), "dropped": kind, "reason": "count is not an integer"})
+                    continue
+            if kind in {"xlsx_values_present", "xlsx_rows_present", "xlsx_cell_equals"}:
+                for key in ("values", "rows", "value"):
+                    if key not in a or a[key] is None:
+                        continue
+                    before = a[key]
+                    conv = lambda v: (float(v.strip()) if "." in v else int(v.strip())) if isinstance(v, str) and _NUMERIC_TEXT.match(v.strip()) else v
+                    if key == "value":
+                        a[key] = conv(before)
+                    elif key == "values":
+                        a[key] = [conv(v) for v in before]
+                    else:
+                        a[key] = [[conv(v) for v in r] if isinstance(r, list) else r for r in before]
+                    if a[key] != before:
+                        changes.append({"subgoal_id": sg.get("id"), "kind": kind, "numeric_text_to_number": key})
+            keep.append(a)
+        for (path, sheet), vals in downgraded.items():
+            vals = [(float(v.strip()) if "." in v else int(v.strip())) if isinstance(v, str) and _NUMERIC_TEXT.match(v.strip()) else v
+                    for v in vals]
+            keep.append({"kind": "xlsx_values_present", "path": path, **({"sheet": sheet} if sheet else {}), "values": vals})
+            changes.append({"subgoal_id": sg.get("id"), "downgraded_to": "xlsx_values_present", "values": vals})
+        if isinstance(spec, dict) and isinstance(spec.get("checks"), list):
+            spec["checks"] = keep
+    return changes
+
+
+_REVIEW_ONLY = re.compile(r"^\s*(inspect|verify|ensure|confirm|check|validate|review|examine)\b", re.IGNORECASE)
+
+
+def _workbooks_of(sg: dict[str, Any]) -> frozenset[str]:
+    paths = frozenset(a["path"] for a in _assertions_of(sg)
+                      if str(a.get("kind", "")).startswith("xlsx_") and isinstance(a.get("path"), str) and a["path"])
+    if paths:
+        return paths
+    return frozenset(re.findall(r"[^\s\"'`,;()<>]+\.xlsx\b", str(sg.get("instruction", "")), re.IGNORECASE))
+
+
+def consolidate_sheet_subgoals(subgoals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One sheet subgoal per workbook. A small planner splits a single job into inspect / create /
+    fill / verify subgoals; that wastes steps and lets a later subgoal trip over an earlier one's
+    output. Review-only sheet subgoals are dropped (the checker verifies, and unchanged sheets are
+    protected by the sheet-state contract) and consecutive sheet subgoals on the same workbook set are merged."""
+    changes: list[dict[str, Any]] = []
+    kept = [sg for sg in subgoals
+            if not (sg.get("capability") == "sheet" and _REVIEW_ONLY.match(str(sg.get("instruction", ""))))]
+    if kept and len(kept) < len(subgoals):
+        dropped = [sg.get("id") for sg in subgoals if sg not in kept]
+        changes.append({"dropped_review_only": dropped})
+    merged: list[dict[str, Any]] = []
+    for sg in kept:
+        prev = merged[-1] if merged else None
+        wb = _workbooks_of(sg)
+        if prev and sg.get("capability") == "sheet" and prev.get("capability") == "sheet" and wb and wb == _workbooks_of(prev):
+            prev["instruction"] = f"{str(prev.get('instruction', '')).rstrip()} Then: {sg.get('instruction', '')}"
+            prev["expected_output"] = f"{prev.get('expected_output', '')} {sg.get('expected_output', '')}".strip()
+            checks = prev["check_spec"].setdefault("checks", [])
+            for a in _assertions_of(sg):
+                if a not in checks:
+                    checks.append(a)
+            changes.append({"merged": sg.get("id"), "into": prev.get("id")})
+        else:
+            merged.append(sg)
+    if merged:
+        for i, sg in enumerate(merged):
+            sg["id"] = i
+        subgoals[:] = merged
+    return changes

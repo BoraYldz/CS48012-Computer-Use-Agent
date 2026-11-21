@@ -7,6 +7,7 @@ from pathlib import Path
 from agent import sheet_tools as st
 from agent.local_runtime import LocalVM
 from agent.runtime import WORKER_TOOLS, max_steps
+assert "xlsx_group_summary" in WORKER_TOOLS["sheet"]
 
 
 def ev(formula, cells=None):
@@ -119,7 +120,7 @@ class WorkbookToolTests(unittest.TestCase):
         self.assertEqual(len(self.vm.xlsx_info("w.xlsx")["sheets"]), 1)
 
     def test_replace_existing_data_needs_approval_and_fails_closed(self):
-        self.sheet([["a"], [1], [2]])
+        st.write(self.vm._p("w.xlsx"), [["a"], [1], [2]], "S")          # pre-existing user data
         with self.assertRaisesRegex(PermissionError, "DENIED"):
             self.vm.xlsx_write("w.xlsx", [["z"]], sheet="S")
         self.assertEqual(self.vm.xlsx_read("w.xlsx")["rows"], [["a"], [1], [2]])
@@ -129,6 +130,32 @@ class WorkbookToolTests(unittest.TestCase):
         self.assertEqual(self.vm.xlsx_read("w.xlsx")["rows"], [["z"]])
         self.assertIn("REPLACE sheet 'S'", seen[0]["summary"])
         self.assertIn("3 existing row", seen[0]["summary"])   # header + 2 data rows
+
+    def test_sheet_the_agent_created_itself_can_be_rebuilt_without_approval(self):   # s06: denied own sheet
+        self.sheet([["a"], [1], [2]], name="Mine")
+        self.vm.xlsx_write("w.xlsx", [["a"], [9]], sheet="Mine")
+        self.assertEqual(self.vm.approval_log, [])
+        self.assertEqual(self.vm.xlsx_read("w.xlsx", sheet="Mine")["rows"], [["a"], [9]])
+
+    def test_fixture_data_stays_protected_even_after_agent_wrote_the_same_path(self):
+        self.sheet([["a"], [1]], name="S")
+        import base64
+        self.vm.harness_put_file("w.xlsx", base64.b64encode((self.vm._p("w.xlsx")).read_bytes()).decode())
+        with self.assertRaisesRegex(PermissionError, "DENIED"):
+            self.vm.xlsx_write("w.xlsx", [["z"]], sheet="S")
+
+    def test_group_summary_computes_writes_and_sorts(self):
+        self.sheet([["Region", "Revenue"], ["North", 120.5], ["South", 80], ["East", 200.25], ["North", 99.5],
+                    ["West", 40], ["South", 150], ["East", 10.75], ["North", 30]], name="Sales")
+        out = self.vm.xlsx_group_summary("w.xlsx", group_by="Region", column="Revenue", source_sheet="Sales",
+                                         target_sheet="Totals")
+        self.assertIn("wrote 5 rows", out)
+        rows = self.vm.xlsx_read("w.xlsx", sheet="Totals")["rows"]
+        self.assertEqual(rows, [["Region", "Revenue"], ["East", 211], ["North", 250], ["South", 230], ["West", 40]])
+        self.assertEqual(self.vm.xlsx_info("w.xlsx")["sheets"][0]["name"], "Sales")
+        self.vm.xlsx_group_summary("w.xlsx", group_by="Region", column="Revenue", source_sheet="Sales",
+                                   target_sheet="Totals", op="count")      # own sheet: rebuilt without a prompt
+        self.assertEqual(self.vm.approval_log, [])
 
     def test_creating_new_sheet_or_workbook_needs_no_approval(self):
         self.sheet([["a"]], name="One")

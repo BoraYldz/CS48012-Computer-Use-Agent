@@ -21,7 +21,7 @@ class CheckAssertion(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: str = Field(description="Supported: path_exists, path_absent, directory_empty, directory_contains_files, files_moved_by_extension, no_files_by_extension, text_contains, text_equals, xlsx_sheet_exists, xlsx_values_present, xlsx_rows_present, xlsx_cell_equals, xlsx_formula_present, xlsx_data_row_count, xlsx_aggregate_matches, xlsx_sheets_preserved")
+    kind: str = Field(description="Supported: path_exists, path_absent, directory_empty, directory_contains_files, files_moved_by_extension, no_files_by_extension, text_contains, text_equals, xlsx_sheet_exists, xlsx_values_present, xlsx_rows_present, xlsx_cell_equals, xlsx_formula_present, xlsx_data_row_count, xlsx_aggregate_matches, xlsx_group_aggregate_matches, xlsx_sheets_preserved")
     path: str | None = None
     is_dir: bool | None = None
     text: str | None = None
@@ -42,6 +42,7 @@ class CheckAssertion(BaseModel):
     contains: str | None = None              # substring a formula must contain
     count: int | None = None                 # expected number of data rows (rows below the header)
     column: str | None = None                # header name or column letter in the source table
+    group_by: str | None = None              # header of the grouping column (xlsx_group_aggregate_matches)
     op: str | None = None                    # sum | avg | min | max | count
     source_path: str | None = None           # workbook the aggregate is computed from
     source_sheet: str | None = None
@@ -69,7 +70,7 @@ CHECKS_BY_CAPABILITY = {
     "sheet": COMMON_CHECKS | {
         "xlsx_sheet_exists", "xlsx_values_present", "xlsx_rows_present",
         "xlsx_cell_equals", "xlsx_formula_present", "xlsx_data_row_count",
-        "xlsx_aggregate_matches", "xlsx_sheets_preserved",
+        "xlsx_aggregate_matches", "xlsx_group_aggregate_matches", "xlsx_sheets_preserved",
     },
 }
 SUPPORTED_CHECKS = set().union(*CHECKS_BY_CAPABILITY.values())
@@ -100,12 +101,27 @@ def _row_matches(actual: list[Any], expected: list[Any]) -> bool:
 
 # ---------------------------------------------------------------- spreadsheet checks
 XLSX_EXTRA_CHECKS = {"xlsx_cell_equals", "xlsx_formula_present", "xlsx_data_row_count",
-                     "xlsx_aggregate_matches", "xlsx_sheets_preserved"}
+                     "xlsx_aggregate_matches", "xlsx_group_aggregate_matches", "xlsx_sheets_preserved"}
 _CELL_ADDR = re.compile(r"^[A-Za-z]{1,3}[1-9]\d*$")
 
 
 def _isnum(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _txt_key(v: Any) -> str:
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip().casefold()
+
+
+def _find_column(header: list[Any], ref: str) -> int | None:
+    idx = next((i for i, h in enumerate(header) if h is not None and str(h).strip().casefold() == ref.strip().casefold()), None)
+    if idx is None and re.fullmatch(r"[A-Za-z]{1,3}", ref.strip()):
+        from openpyxl.utils import column_index_from_string
+        cand = column_index_from_string(ref.strip().upper()) - 1
+        idx = cand if cand < len(header) else None
+    return idx
 
 
 def _norm_formula(text: str) -> str:
@@ -206,6 +222,10 @@ async def _check_xlsx_extra(vm, kind: str, a: dict[str, Any]) -> tuple[str, str]
 
     if kind == "xlsx_data_row_count":
         expected = a.get("count")
+        if isinstance(expected, str) and expected.strip().isdigit():
+            expected = int(expected.strip())
+        elif isinstance(expected, float) and expected.is_integer():
+            expected = int(expected)
         if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
             return _unknown(f"xlsx_data_row_count {path!r}: count must be a non-negative integer")
         kwargs: dict[str, Any] = {"path": path, "max_rows": 5000}
@@ -220,6 +240,63 @@ async def _check_xlsx_extra(vm, kind: str, a: dict[str, Any]) -> tuple[str, str]
         if actual == expected:
             return _pass(f"xlsx_data_row_count {path!r}: {actual} data row(s) below the header")
         return _fail(f"xlsx_data_row_count {path!r}: {actual} data row(s) below the header, expected {expected}")
+
+    if kind == "xlsx_group_aggregate_matches":
+        src, op = a.get("source_path"), (a.get("op") or "").lower()
+        column, group_by = a.get("column"), a.get("group_by")
+        if not (isinstance(src, str) and src and op in {"sum", "avg", "min", "max", "count"}
+                and isinstance(column, str) and column and isinstance(group_by, str) and group_by):
+            return _unknown("xlsx_group_aggregate_matches: needs source_path, column, group_by and op")
+        ssheet = a.get("source_sheet") if isinstance(a.get("source_sheet"), str) and a.get("source_sheet") else None
+        blocked = await _workbook_state(vm, kind, src, ssheet)
+        if blocked:
+            return blocked
+        kw: dict[str, Any] = {"path": src, "max_rows": 5000}
+        if ssheet:
+            kw["sheet"] = ssheet
+        sb = await vm.call("xlsx_read", **kw)
+        srows = sb.get("rows") if isinstance(sb, dict) else None
+        if not isinstance(srows, list) or not srows:
+            return _unknown(f"xlsx_group_aggregate_matches {src!r}: xlsx_read returned an unexpected result")
+        if sb.get("truncated"):
+            return _unknown(f"xlsx_group_aggregate_matches {src!r}: source larger than the 5000 inspected rows")
+        ci, gi = _find_column(srows[0], column), _find_column(srows[0], group_by)
+        if ci is None or gi is None:
+            return _unknown(f"xlsx_group_aggregate_matches {src!r}: column {column!r} or group {group_by!r} not in header {srows[0]}")
+        groups: dict[str, list[Any]] = {}
+        for r in srows[1:]:
+            if gi < len(r) and r[gi] not in (None, ""):
+                groups.setdefault(str(r[gi]).strip(), []).append(r[ci] if ci < len(r) else None)
+        expected_by_group: dict[str, float] = {}
+        for key, vals in groups.items():
+            nums = [float(v) for v in vals if _isnum(v)]
+            if op == "count":
+                expected_by_group[key] = float(sum(1 for v in vals if v not in (None, "")))
+            elif nums:
+                expected_by_group[key] = {"sum": sum(nums), "avg": sum(nums) / len(nums), "min": min(nums), "max": max(nums)}[op]
+        if not expected_by_group:
+            return _unknown(f"xlsx_group_aggregate_matches {src!r}: no numeric data to aggregate")
+        kw = {"path": path, "max_rows": 5000}
+        if sheet:
+            kw["sheet"] = sheet
+        tb = await vm.call("xlsx_read", **kw)
+        trows = tb.get("rows") if isinstance(tb, dict) else None
+        if not isinstance(trows, list):
+            return _unknown(f"xlsx_group_aggregate_matches {path!r}: xlsx_read returned an unexpected result")
+        tol = float(a.get("tolerance") if a.get("tolerance") is not None else 0.005)
+        missing, wrong = [], []
+        for key, exp in sorted(expected_by_group.items()):
+            row = next((r for r in trows if any(_txt_key(v) == _txt_key(key) for v in r if isinstance(v, str) or _isnum(v))), None)
+            if row is None:
+                missing.append(key)
+                continue
+            nums = [v for v in row if _isnum(v) and _txt_key(v) != _txt_key(key)]
+            if not any(abs(v - exp) <= tol for v in nums):
+                wrong.append(f"{key}: sheet has {nums}, recomputed {op}({column}) is {exp:g}")
+        if missing or wrong:
+            parts = ([f"missing groups {missing}"] if missing else []) + ([f"wrong values: " + "; ".join(wrong)] if wrong else [])
+            return _fail(f"xlsx_group_aggregate_matches {path!r}: " + " | ".join(parts) + f" (recomputed from {src!r})")
+        return _pass(f"xlsx_group_aggregate_matches {path!r}: all {len(expected_by_group)} group(s) match {op}({column}) recomputed from {src!r}")
 
     # xlsx_aggregate_matches: the expected number is recomputed from the SOURCE data in code.
     src, op, column = a.get("source_path"), (a.get("op") or "").lower(), a.get("column")

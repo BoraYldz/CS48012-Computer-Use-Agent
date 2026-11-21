@@ -102,6 +102,9 @@ class LocalVM:
         # approver(request) -> bool. None means deny: the gate fails closed.
         self.approver: Callable[[dict], bool] | None = None
         self.approval_log: list[dict] = []
+        # Sheets this agent created itself (path, sheet): rebuilding its own output is not
+        # destroying user data, so only PRE-EXISTING sheets are approval-gated.
+        self._owned_sheets: set[tuple[str, str]] = set()
         self.event_sink: Callable[..., Any] | None = None  # e.g. RunLog.write
         self._functions = {
             "list_dir": self.list_dir,
@@ -118,6 +121,7 @@ class LocalVM:
             "xlsx_read": self.xlsx_read,
             "xlsx_query": self.xlsx_query,
             "xlsx_aggregate": self.xlsx_aggregate,
+            "xlsx_group_summary": self.xlsx_group_summary,
             "xlsx_write": self.xlsx_write,
             "xlsx_append_rows": self.xlsx_append_rows,
             "xlsx_set_cells": self.xlsx_set_cells,
@@ -362,12 +366,33 @@ class LocalVM:
         If the sheet already has data, replace_sheet=true DESTROYS it and needs human approval;
         to add to existing data use xlsx_append_rows or xlsx_set_cells instead. Other sheets are kept."""
         p = self._p(path)
+        self._gate_sheet_replace("xlsx_write", path, p, sheet, replace_sheet)
+        return self._owned_write(p, sheet, lambda: sheet_tools.write(p, rows, sheet, replace_sheet))
+
+    def xlsx_group_summary(self, path: str, group_by: str, column: str, op: str = "sum",
+                           target_sheet: str = "Summary", source_sheet: str | None = None,
+                           replace_sheet: bool = True) -> str:
+        """Compute AND write a per-group table in one call: header (group column, value column), one row per
+        group sorted A-Z, values = sum/avg/min/max/count of `column`. Use for 'total X per Y'; never type the
+        numbers yourself. Replacing an existing sheet with data needs human approval."""
+        p = self._p(path)
+        self._gate_sheet_replace("xlsx_group_summary", path, p, target_sheet, replace_sheet)
+        return self._owned_write(p, target_sheet, lambda: sheet_tools.summarize(
+            self._existing_xlsx(path), source_sheet, group_by, column, op, target_sheet, replace_sheet))
+
+    def _gate_sheet_replace(self, tool: str, path: str, p: Path, sheet: str, replace_sheet: bool) -> None:
         existing = sheet_tools.sheet_has_data(p, sheet)
-        if existing and replace_sheet:
+        if existing and replace_sheet and (str(p), sheet) not in self._owned_sheets:
             self._require_approval(
-                "xlsx_write", {"path": path, "sheet": sheet, "replace_sheet": True},
+                tool, {"path": path, "sheet": sheet, "replace_sheet": True},
                 f"REPLACE sheet '{sheet}' in {path}: its {existing} existing row(s) will be destroyed")
-        return sheet_tools.write(p, rows, sheet, replace_sheet)
+
+    def _owned_write(self, p: Path, sheet: str, action):
+        fresh = sheet_tools.sheet_has_data(p, sheet) == 0
+        result = action()
+        if fresh:
+            self._owned_sheets.add((str(p), sheet))
+        return result
 
     def xlsx_append_rows(self, path: str, sheet: str, rows: list[list]) -> str:
         """Append rows below the last used row of an existing sheet. Existing cells are never changed."""
@@ -389,6 +414,7 @@ class LocalVM:
         p = self._p(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(base64.b64decode(b64, validate=True))
+        self._owned_sheets = {k for k in self._owned_sheets if k[0] != str(p)}   # a fixture is user data
         return "ok"
 
     def harness_get_file(self, path: str) -> str:

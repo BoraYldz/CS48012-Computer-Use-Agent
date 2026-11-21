@@ -235,6 +235,14 @@ def xlsx_write(path: str, rows: list[list], sheet: str = "Sheet1", replace_sheet
 
 
 @mcp.tool()
+def xlsx_group_summary(path: str, group_by: str, column: str, op: str = "sum", target_sheet: str = "Summary",
+                       source_sheet: str | None = None, replace_sheet: bool = True) -> str:
+    """Compute AND write a per-group table in one call: header (group column, value column), one row per
+    group sorted A-Z, values = sum/avg/min/max/count of `column`. Use for 'total X per Y'."""
+    return sheet_tools.summarize(_xlsx(path), source_sheet, group_by, column, op, target_sheet, replace_sheet)
+
+
+@mcp.tool()
 def xlsx_append_rows(path: str, sheet: str, rows: list[list]) -> str:
     """Append rows below the last used row of an existing sheet. Existing cells are never changed."""
     return sheet_tools.append_rows(_p(path), sheet, rows)

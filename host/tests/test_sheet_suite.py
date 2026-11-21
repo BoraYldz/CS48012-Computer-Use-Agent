@@ -70,7 +70,10 @@ class SheetSuiteTests(unittest.TestCase):
         return run(go())
 
     def test_numbers_stored_as_text_are_rejected(self):
-        ok, detail = self._break("s01", lambda vm, b: vm.xlsx_set_cells(f"{b}/inventory.xlsx", "Stock", {"B2": "120"}))
+        def plant_text(vm, b):                       # tools coerce "120" -> 120, so write text directly
+            from openpyxl import load_workbook
+            wb = load_workbook(vm._p(f"{b}/inventory.xlsx")); wb["Stock"]["B2"] = "120"; wb.save(vm._p(f"{b}/inventory.xlsx"))
+        ok, detail = self._break("s01", plant_text)
         self.assertFalse(ok)
         self.assertIn("row 2", detail)
 

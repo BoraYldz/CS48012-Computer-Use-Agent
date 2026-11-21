@@ -28,7 +28,9 @@ class CheckerTests(unittest.TestCase):
         self.vm = LocalVM(Path(self.tmp.name) / "ws")
         self.addCleanup(self.tmp.cleanup)
         self.vm.xlsx_write("sales.xlsx", [["Region", "Revenue"], ["N", 10.5], ["S", 20], ["N", 4.5]], sheet="Sales")
-        self.vm.xlsx_write("sales.xlsx", [["Metric", "Value"], ["Total", 35], ["Text", "35"], ["F", "=SUM(Sales!B2:B4)"]], sheet="Out")
+        self.vm.xlsx_write("sales.xlsx", [["Metric", "Value"], ["Total", 35], ["Text", 0], ["F", "=SUM(Sales!B2:B4)"]], sheet="Out")
+        from openpyxl import load_workbook          # tools coerce "35" -> 35, so plant real text directly
+        wb = load_workbook(self.vm._p("sales.xlsx")); wb["Out"]["B3"] = "35"; wb.save(self.vm._p("sales.xlsx"))
 
     def chk(self, *assertions):
         return run(check_spec(self.vm, {"checks": list(assertions)}, capability="sheet"))
@@ -80,6 +82,24 @@ class CheckerTests(unittest.TestCase):
             self.vm.xlsx_set_cells("sales.xlsx", "Out", {"B2": cell_value})
             self.assertEqual(self.chk({**spec, "op": op})["status"], "pass", op)
         self.assertEqual(self.chk({**spec, "column": "Profit"})["status"], "unknown")
+
+    def test_group_aggregate_recomputes_every_group(self):        # s06: worker wrote North=481, truth is 15
+        spec = self.a("xlsx_group_aggregate_matches", sheet="Totals", source_path="sales.xlsx", source_sheet="Sales",
+                      column="Revenue", group_by="Region", op="sum")
+        self.vm.xlsx_write("sales.xlsx", [["Region", "Revenue"], ["N", 15], ["S", 20]], sheet="Totals")
+        self.assertEqual(self.chk(spec)["status"], "pass")
+        self.vm.xlsx_set_cells("sales.xlsx", "Totals", {"B2": 481})
+        r = self.chk(spec)
+        self.assertEqual(r["status"], "fail")
+        self.assertIn("N: sheet has [481]", r["evidence"])
+        self.assertIn("15", r["evidence"])
+        self.vm.approver = lambda req: True               # replacing an existing sheet is gated
+        self.vm.xlsx_write("sales.xlsx", [["Region", "Revenue"], ["N", 15]], sheet="Totals")
+        self.assertIn("missing groups ['S']", self.chk(spec)["evidence"])
+        self.assertEqual(self.chk({**spec, "group_by": "Nope"})["status"], "unknown")
+
+    def test_row_count_accepts_numeric_text(self):                # s03: planner sent count as text
+        self.assertEqual(self.chk(self.a("xlsx_data_row_count", sheet="Sales", count="3"))["status"], "pass")
 
     def test_snapshot_protects_the_sheet_the_check_does_not_name(self):
         snap = run(snapshot_sheet_contract(self.vm, {"id": 0, "capability": "sheet", "check_spec": {"checks": [
@@ -167,8 +187,9 @@ class SheetGraphTests(unittest.TestCase):
         self.root = Path(self.temp.name) / "ws"
         self.vm = LocalVM(self.root)
         asyncio.run(self.vm.connect())
-        self.vm.xlsx_write("prices.xlsx", [["Item", "Price"], ["Tea", 10], ["Coffee", 20]], sheet="Prices")
-        self.vm.xlsx_write("prices.xlsx", [["Note"], ["keep"]], sheet="Notes")
+        from agent import sheet_tools as _st            # pre-existing user data (not agent-owned)
+        _st.write(self.vm._p("prices.xlsx"), [["Item", "Price"], ["Tea", 10], ["Coffee", 20]], "Prices")
+        _st.write(self.vm._p("prices.xlsx"), [["Note"], ["keep"]], "Notes")
         self.runs = Path(self.temp.name) / "runs"
         mock.patch("agent.runtime.RUNS_DIR", self.runs).start()
         self.addCleanup(mock.patch.stopall)
