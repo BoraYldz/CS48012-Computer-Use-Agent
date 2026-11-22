@@ -43,7 +43,7 @@ RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
 
 # Which tools each worker may use (least privilege). Harness tools are never listed.
 WORKER_TOOLS = {
-    "files": ["list_dir", "path_info", "make_dirs", "move_path", "move_files", "copy_path",
+    "files": ["list_dir", "path_info", "make_dirs", "move_path", "move_files", "copy_path", "copy_files",
               "read_text", "write_text", "read_pdf_text", "delete_path"],
     # Sheet worker: read-only file access for inputs (no move/copy/delete/write_text) plus the
     # spreadsheet tools. Replacing existing sheet data is approval-gated inside xlsx_write.
@@ -57,6 +57,11 @@ WORKER_TOOLS = {
 def bound_move_enabled() -> bool:
     """BOUND_MOVE=on restores the planner-bound `move_expected_files` tool (ablation switch)."""
     return os.getenv("BOUND_MOVE", "off").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def plan_fastpath_enabled() -> bool:
+    """PLAN_FASTPATH=on re-enables the phrase-matching deterministic planner (ablation only; default off)."""
+    return os.getenv("PLAN_FASTPATH", "off").strip().lower() in {"1", "true", "on", "yes"}
 
 
 def unload_models() -> None:

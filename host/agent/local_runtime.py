@@ -113,6 +113,7 @@ class LocalVM:
             "move_path": self.move_path,
             "move_files": self.move_files,
             "copy_path": self.copy_path,
+            "copy_files": self.copy_files,
             "delete_path": self.delete_path,
             "read_text": self.read_text,
             "write_text": self.write_text,
@@ -233,7 +234,7 @@ class LocalVM:
         return "ok"
 
     def move_files(self, src_dir: str, filenames: list[str], dst_dir: str) -> dict[str, Any]:
-        """Move an explicit list of files from one directory into another, preserving filenames.
+        """MOVE an explicit list of files into another directory (the originals disappear from the source). To keep the originals use copy_files.
 
         The destination directory is created when needed. Every source must be a
         direct child file of src_dir. Wildcards and nested paths are rejected, and
@@ -274,6 +275,37 @@ class LocalVM:
             shutil.move(str(source), str(destination))
             moved.append(filename)
         return {"moved": moved, "count": len(moved), "destination": dst_dir}
+
+    def copy_files(self, src_dir: str, filenames: list[str], dst_dir: str) -> dict[str, Any]:
+        """COPY an explicit list of files into another directory; the originals stay where they are. Filenames are preserved, the destination is created if needed, nothing is overwritten."""
+        source_dir, destination_dir = self._p(src_dir), self._p(dst_dir)
+        if not source_dir.is_dir():
+            raise NotADirectoryError(f"source directory does not exist or is not a directory: {src_dir}")
+        if not isinstance(filenames, list) or not filenames:
+            raise ValueError("filenames must be a non-empty list of exact file names returned by list_dir")
+        if destination_dir == source_dir:
+            raise ValueError("source and destination directories must be different")
+        plan: list[tuple[str, Path, Path]] = []
+        seen: set[str] = set()
+        for filename in filenames:
+            if not isinstance(filename, str) or not filename.strip():
+                raise ValueError("each filename must be a non-empty string")
+            if Path(filename).name != filename or filename in {".", ".."} or any(ch in filename for ch in "*?[]"):
+                raise ValueError(f"expected an exact basename, not a path or wildcard: {filename!r}")
+            if filename in seen:
+                raise ValueError(f"duplicate filename in copy request: {filename}")
+            seen.add(filename)
+            source = self._p((source_dir / filename).relative_to(self.root).as_posix())
+            if not source.is_file():
+                raise FileNotFoundError(f"source file does not exist: {src_dir}/{filename}")
+            destination = self._p((destination_dir / filename).relative_to(self.root).as_posix())
+            if destination.exists():
+                raise FileExistsError(f"destination file already exists: {dst_dir}/{filename}")
+            plan.append((filename, source, destination))
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for _, source, destination in plan:      # all entries validated first: no partial copies
+            shutil.copy2(source, destination)
+        return {"copied": [name for name, _, _ in plan], "count": len(plan), "destination": dst_dir}
 
     def copy_path(self, src: str, dst: str, overwrite: bool = False) -> str:
         """Copy a file; refuse to overwrite by default."""

@@ -46,6 +46,7 @@ async def _main():
     e.add_argument("--runs", type=int, default=3); e.add_argument("--only", default=None)
     e.add_argument("--tag", choices=["core", "extra", "all"], default="core")
     e.add_argument("--bound", choices=["on", "off"], default=None, help="ablation: planner-bound move tool")
+    e.add_argument("--fastpath", choices=["on", "off"], default=None, help="ablation: phrase-matching deterministic planner")
     a = ap.parse_args()
 
     if a.cmd == "task" and a.reset:
@@ -60,7 +61,7 @@ async def _main():
 
     if a.cmd == "eval":
         from .evalrun import run_suite
-        await run_suite(vm, runs=a.runs, only=a.only, tag=a.tag, bound=a.bound, suite=a.suite)
+        await run_suite(vm, runs=a.runs, only=a.only, tag=a.tag, bound=a.bound, fastpath=a.fastpath, suite=a.suite)
         return
 
     if a.cmd == "ping":

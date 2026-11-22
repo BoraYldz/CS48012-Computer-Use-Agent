@@ -26,6 +26,7 @@ _PATH_ASSERTION_KINDS = {
     "xlsx_formula_present",
     "xlsx_data_row_count",
     "xlsx_aggregate_matches", "xlsx_group_aggregate_matches", "xlsx_csv_matches", "file_content_matches",
+    "file_ops",
 }
 
 
@@ -82,7 +83,9 @@ def apply_explicit_location_anchor(
                 continue
             if assertion.get("kind") not in _PATH_ASSERTION_KINDS:
                 continue
-            for key in ("path", "source_path"):
+            keys = ("path", "source_path") + (("source_dir", "destination_dir")
+                                              if assertion.get("kind") == "file_ops" else ())
+            for key in keys:
                 _anchor_key(assertion, key, anchor, subgoal, changes)
 
     return {"anchor": anchor, "changes": changes}

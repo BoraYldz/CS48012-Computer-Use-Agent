@@ -109,7 +109,10 @@ def markdown(summary: dict, config: dict, runs: int) -> str:
     return "\n".join(lines)
 
 
-async def run_suite(vm, runs: int, only: str | None, tag: str, bound: str | None, suite: str = "files") -> dict:
+async def run_suite(vm, runs: int, only: str | None, tag: str, bound: str | None, suite: str = "files",
+                    fastpath: str | None = None) -> dict:
+    if fastpath:
+        os.environ["PLAN_FASTPATH"] = "on" if fastpath == "on" else "off"
     if bound:
         os.environ["BOUND_MOVE"] = "on" if bound == "on" else "off"
     tasks = SUITES[suite].select(only=only, tag=tag)
@@ -118,6 +121,7 @@ async def run_suite(vm, runs: int, only: str | None, tag: str, bound: str | None
     config = {
         "suite": suite, "scope": AGENT_SCOPE, "root": str(vm.root), "runs": runs,
         "bound_move": os.getenv("BOUND_MOVE", "off"),
+        "plan_fastpath": os.getenv("PLAN_FASTPATH", "off"),
         "worker_model": os.getenv("WORKER_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b")),
         "planner_model": os.getenv("PLANNER_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b")),
         "max_steps": {"files": max_steps("files"), "sheet": max_steps("sheet")},

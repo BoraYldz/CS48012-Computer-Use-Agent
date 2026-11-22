@@ -12,6 +12,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .file_ops import check_file_ops
 from .sheet_tools import coerce_number, digest_rows
 
 
@@ -23,7 +24,7 @@ class CheckAssertion(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: str = Field(description="Supported: path_exists, path_absent, file_content_matches, directory_empty, directory_contains_files, files_moved_by_extension, no_files_by_extension, text_contains, text_equals, xlsx_sheet_exists, xlsx_values_present, xlsx_rows_present, xlsx_cell_equals, xlsx_formula_present, xlsx_data_row_count, xlsx_aggregate_matches, xlsx_group_aggregate_matches, xlsx_sheets_preserved, xlsx_csv_matches")
+    kind: str = Field(description="Supported: path_exists, path_absent, file_content_matches, directory_empty, directory_contains_files, files_moved_by_extension, file_ops, no_files_by_extension, text_contains, text_equals, xlsx_sheet_exists, xlsx_values_present, xlsx_rows_present, xlsx_cell_equals, xlsx_formula_present, xlsx_data_row_count, xlsx_aggregate_matches, xlsx_group_aggregate_matches, xlsx_sheets_preserved, xlsx_csv_matches")
     path: str | None = None
     is_dir: bool | None = None
     text: str | None = None
@@ -49,6 +50,10 @@ class CheckAssertion(BaseModel):
     source_path: str | None = None           # source workbook or CSV path, depending on assertion kind
     source_sheet: str | None = None
     preserved_sheets: dict[str, str] | None = None   # orchestrator-filled sheet digests
+    # file_ops assertions (op / extension / recursive / source_dir / destination_dir are shared fields)
+    rename_prefix: str | None = None
+    rename_suffix: str | None = None
+    expected_ops: list[dict[str, Any]] | None = None  # orchestrator-filled from the real files
 
 
 class CheckSpec(BaseModel):
@@ -68,7 +73,7 @@ class CheckResult(TypedDict):
 
 COMMON_CHECKS = {"path_exists", "path_absent"}
 CHECKS_BY_CAPABILITY = {
-    "files": COMMON_CHECKS | {"file_content_matches", "directory_empty", "directory_contains_files", "files_moved_by_extension", "no_files_by_extension", "text_contains", "text_equals"},
+    "files": COMMON_CHECKS | {"file_content_matches", "directory_empty", "directory_contains_files", "files_moved_by_extension", "file_ops", "no_files_by_extension", "text_contains", "text_equals"},
     "sheet": COMMON_CHECKS | {
         "xlsx_sheet_exists", "xlsx_values_present", "xlsx_rows_present",
         "xlsx_cell_equals", "xlsx_formula_present", "xlsx_data_row_count",
@@ -494,6 +499,9 @@ async def _check_assertion(vm, assertion: dict[str, Any], allowed_checks: set[st
             )
 
     try:
+        if kind == "file_ops":
+            return await check_file_ops(vm, assertion)
+
         if kind in XLSX_EXTRA_CHECKS:
             return await _check_xlsx_extra(vm, kind, assertion)
 
