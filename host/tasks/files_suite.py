@@ -428,7 +428,8 @@ def _t14():
 
 
 def all_tasks() -> list[FileTask]:
-    return [f() for f in (_t01, _t02, _t03, _t04, _t05, _t06, _t07, _t08, _t09, _t10, _t11, _t12, _t13, _t14)]
+    from .heldout_suite import heldout_tasks  # lazy: heldout_suite imports this module
+    return [f() for f in (_t01, _t02, _t03, _t04, _t05, _t06, _t07, _t08, _t09, _t10, _t11, _t12, _t13, _t14)] + heldout_tasks()
 
 
 def select(only: str | None = None, tag: str = "core") -> list[FileTask]:

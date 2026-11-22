@@ -44,7 +44,7 @@ async def _main():
     t.add_argument("--auto-approve", action="store_true")
     e = sub.add_parser("eval"); e.add_argument("suite", choices=["files", "sheet"])
     e.add_argument("--runs", type=int, default=3); e.add_argument("--only", default=None)
-    e.add_argument("--tag", choices=["core", "extra", "all"], default="core")
+    e.add_argument("--tag", choices=["core", "extra", "heldout", "all"], default="core")
     e.add_argument("--bound", choices=["on", "off"], default=None, help="ablation: planner-bound move tool")
     e.add_argument("--fastpath", choices=["on", "off"], default=None, help="ablation: phrase-matching deterministic planner")
     a = ap.parse_args()

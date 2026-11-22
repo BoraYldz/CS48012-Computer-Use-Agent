@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 
 from .checkers import CheckSpec, check_spec
 from .contracts import deletion_contracts, delete_allowed, describe, snapshot_deletion_contracts
+from .plan_gates import (PLAN_GAP_NOTE, drop_unrequested_deletion_checks, ground_free_text_checks,
+                         neutralize_plan, precheck_named_sources, state_change_gap)
 from .file_ops import contract_pairs, describe_ops, snapshot_file_ops, violation
 from .planning import apply_plan_path_rules
 from .plan_validation import (
@@ -133,6 +135,8 @@ Choose the write tool by intent:
 - new workbook or new sheet from specified rows -> xlsx_write
 - change a value identified by a row label (for example, the Price for Item=Coffee) -> xlsx_update_row with the exact match column/value and updated column/value. It requires exactly one matching row; do not guess cell addresses.
 - add a formula column to an existing table -> xlsx_add_formula_column with the new column letter, header and a formula template using {{row}}, for example =B{{row}}+C{{row}}. It determines the data extent and refuses to overwrite a non-empty target column.
+- only the rows matching a condition, optionally sorted or with chosen columns, into a sheet ("orders over 100, largest first") -> xlsx_filter_to_sheet: it filters, sorts and writes in one call; never copy rows by hand
+- add a column holding plain data (the same value in every row, or a list of values) to an existing table -> xlsx_add_column (header goes to row 1 for you). NEVER use xlsx_add_formula_column for non-formula data
 - total / average / count / min / max PER GROUP into a sheet ("revenue per region") -> xlsx_group_summary: it computes and writes the table in one call, sorted A-Z; never type such numbers yourself
 - add rows to a table that already exists -> xlsx_append_rows (never xlsx_write: it would replace the sheet)
 - change specific cells whose addresses are explicitly known -> xlsx_set_cells. For row labels or a new formula column, prefer the dedicated tools above. NEVER use xlsx_append_rows to add a column: it adds new rows at the bottom.
@@ -153,7 +157,8 @@ Your job is to turn deterministic checker evidence into ONE narrow repair instru
 Do not change the user's goal, the subgoal, or its acceptance criteria. Do not suggest bypassing,
 weakening, or editing the verifier. Do not invent facts or claim that a change has already happened.
 Use only the supplied subgoal, checker evidence, and recent tool actions. If the evidence does not
-support a safe repair, say so briefly. Return one actionable instruction, maximum 500 characters."""
+support a safe repair, say so briefly. Name only tools listed in available_tools; never invent a tool.
+Return one actionable instruction, maximum 500 characters."""
 
 
 class PlannedSubgoal(BaseModel):
@@ -400,12 +405,13 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
             )
         else:
             out, parsed = None, None
+            planner_goal = state["goal"]
             for attempt in (1, 2):
                 # Attempt 2 perturbs sampling: a deterministic runaway/invalid generation would repeat at the same temperature.
                 llm = (model("planner") if attempt == 1 else model("planner", temperature=0.4)
                        ).with_structured_output(Plan, include_raw=True)
                 try:
-                    out = await _invoke_planner_with_diagnostics(llm, state["goal"], log)
+                    out = await _invoke_planner_with_diagnostics(llm, planner_goal, log)
                     parsed = out["parsed"]
                 except Exception as exc:
                     if attempt == 2:
@@ -413,6 +419,11 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
                     log.write("planner_retry", attempt=attempt, reason=f"{type(exc).__name__}: {str(exc)[:160]}")
                     continue
                 if parsed is not None and parsed.subgoals:
+                    gap = state_change_gap(state["goal"], [x.model_dump() for x in parsed.subgoals])
+                    if gap and attempt == 1:
+                        log.write("planner_retry", attempt=attempt, reason=gap)
+                        planner_goal = state["goal"] + PLAN_GAP_NOTE
+                        continue
                     break
                 if attempt == 1:
                     log.write("planner_retry", attempt=attempt, reason="no valid plan parsed")
@@ -430,10 +441,16 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
                               ("plan_provenance_filter", lambda: drop_unrequested_empty_checks(state["goal"], subgoals)),
                               ("plan_in_place_move_filter", lambda: drop_in_place_move_checks(subgoals)),
                               ("plan_discovery_filter", lambda: drop_discovery_subgoals(subgoals)),
-                              ("plan_op_resolution", lambda: resolve_file_op_intent(subgoals))):
+                              ("plan_op_resolution", lambda: resolve_file_op_intent(subgoals)),
+                              ("plan_deletion_provenance", lambda: drop_unrequested_deletion_checks(state["goal"], subgoals)),
+                              ("plan_text_grounding", lambda: ground_free_text_checks(state["goal"], subgoals))):
                 changed = fn()
                 if changed:
                     log.write(event, changes=changed)
+            gap = state_change_gap(state["goal"], subgoals)
+            if gap:
+                neutralize_plan(subgoals, gap)
+                log.write("plan_state_change_gap", reason=gap)
         # Check specs are postconditions. Correct an unambiguous planner error
         # before any worker acts: creation targets must exist after creation,
         # and path_absent cannot coexist with a positive assertion for the same path.
@@ -500,6 +517,9 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
             else:
                 log.write("plan_input_snapshot", **snapshot)
 
+        named_changes = await precheck_named_sources(vm, state["goal"], subgoals)
+        if named_changes:
+            log.write("plan_named_source_precheck", changes=named_changes)
         for snap in await snapshot_deletion_contracts(vm, subgoals):
             log.write("plan_deletion_snapshot", **snap)
 
@@ -859,6 +879,7 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
             "expected_output": sg["expected_output"],
             "deterministic_checker_evidence": evidence,
             "recent_tool_actions": recent_steps,
+            "available_tools": list(WORKER_TOOLS.get(sg["capability"], [])),
             "repair_number": attempts + 1,
             "maximum_repairs": MAX_QUICK_FIXES,
         }

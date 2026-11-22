@@ -129,6 +129,8 @@ class LocalVM:
             "xlsx_set_cells": self.xlsx_set_cells,
             "xlsx_update_row": self.xlsx_update_row,
             "xlsx_add_formula_column": self.xlsx_add_formula_column,
+            "xlsx_filter_to_sheet": self.xlsx_filter_to_sheet,
+            "xlsx_add_column": self.xlsx_add_column,
             # Harness-only tools: intentionally absent from WORKER_TOOLS.
             "harness_put_file": self.harness_put_file,
             "harness_get_file": self.harness_get_file,
@@ -423,6 +425,27 @@ class LocalVM:
         self._gate_sheet_replace("xlsx_group_summary", path, p, target_sheet, replace_sheet)
         return self._owned_write(p, target_sheet, lambda: sheet_tools.summarize(
             self._existing_xlsx(path), source_sheet, group_by, column, op, target_sheet, replace_sheet))
+
+    def xlsx_filter_to_sheet(self, path: str, target_sheet: str, where: list[dict] | None = None,
+                             order_by: str | None = None, descending: bool = False,
+                             columns: list[str] | None = None, source_sheet: str | None = None,
+                             replace_sheet: bool = True) -> str:
+        """Filter / sort / project a table AND write the result as a sheet in one call (header + matching
+        rows). Use for 'only the rows where Amount > 100, sorted by Amount'; never copy rows yourself.
+        Replacing an existing sheet with data needs human approval."""
+        p = self._p(path)
+        self._gate_sheet_replace("xlsx_filter_to_sheet", path, p, target_sheet, replace_sheet)
+        return self._owned_write(p, target_sheet, lambda: sheet_tools.filter_to_sheet(
+            self._existing_xlsx(path), source_sheet, target_sheet, where, order_by, descending, columns,
+            replace_sheet))
+
+    def xlsx_add_column(self, path: str, sheet: str, column: str, header: str, value: Any = None,
+                        values: list | None = None, first_data_row: int = 2,
+                        last_data_row: int | None = None) -> str:
+        """Add a column to an existing table: header in row 1, then the same `value` in every data row, or a
+        `values` list (one item per data row). Use this for plain data; formulas use xlsx_add_formula_column."""
+        return sheet_tools.add_column(self._existing_xlsx(path), sheet, column, header, value, values,
+                                      first_data_row, last_data_row)
 
     def _gate_sheet_replace(self, tool: str, path: str, p: Path, sheet: str, replace_sheet: bool) -> None:
         existing = sheet_tools.sheet_has_data(p, sheet)

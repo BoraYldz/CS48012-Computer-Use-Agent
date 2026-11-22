@@ -35,6 +35,7 @@ async def run_one(vm, task, k: int) -> dict:
     policy = task.approve
     vm.approver = lambda req, _p=policy: _p          # approval policy for this task
     run_id = f"eval-{task.id}-r{k}-{uuid.uuid4().hex[:6]}"
+    os.environ["LLM_SEED"] = str(1000 + k)     # independent sample per run (Ollama otherwise repeats runs)
     t0 = time.time()
     crashed = None
     try:

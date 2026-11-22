@@ -647,6 +647,60 @@ def summarize(path: Path, source_sheet: str | None, group_by: str, column: str, 
     return f"{msg}: {json.dumps(rows, ensure_ascii=False, default=str)}"
 
 
+def filter_to_sheet(path: Path, source_sheet: str | None, target_sheet: str, where: list[dict] | None = None,
+                    order_by: str | None = None, descending: bool = False, columns: list[str] | None = None,
+                    replace_sheet: bool = True) -> str:
+    """Filter / sort / project a source table AND write the result as a sheet (header + matching rows)."""
+    res = query(path, source_sheet, where, order_by, descending, columns, limit=100_000)
+    rows = [res["header"]] + res["rows"]
+    msg = write(path, rows, target_sheet, replace_sheet)
+    preview = json.dumps(rows[:6], ensure_ascii=False, default=str)
+    return f"{msg}: {res['matched']} matching row(s) from {res['sheet']}; first rows {preview}"
+
+
+def add_column(path: Path, sheet: str, column: str, header: str, value: Any = None,
+                values: list | None = None, first_data_row: int = 2, last_data_row: int | None = None) -> str:
+    """Add a new column: header in row 1, then one constant `value` for every data row or an explicit `values` list."""
+    if not re.fullmatch(r"[A-Za-z]{1,3}", column or ""):
+        raise ValueError("column must be a column letter such as C")
+    if not isinstance(header, str) or not header.strip():
+        raise ValueError("header must be non-empty text")
+    if (value is None) == (values is None):
+        raise ValueError("give exactly one of value (same for every data row) or values (one per data row)")
+    if first_data_row < 2:
+        raise ValueError("first_data_row must be 2 or greater")
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"workbook does not exist: {Path(path).name}")
+    target_col = column_index_from_string(column.upper())
+    wb = load_workbook(path)
+    try:
+        if sheet not in wb.sheetnames:
+            raise KeyError(f"worksheet not found: {sheet!r}; available sheets: {wb.sheetnames}")
+        ws = wb[sheet]
+        last = _used_rows(ws) if last_data_row is None else last_data_row
+        if last < first_data_row:
+            raise ValueError("no data rows found for the requested column")
+        occupied = [ws.cell(r, target_col).coordinate for r in range(1, last + 1)
+                    if ws.cell(r, target_col).value not in (None, "")]
+        if occupied:
+            raise ValueError(f"target column {column.upper()} is not empty; refusing to overwrite {occupied[:8]}")
+        data_rows = [r for r in range(first_data_row, last + 1)
+                     if any(ws.cell(r, c).value not in (None, "") for c in range(1, target_col))]
+        if values is not None:
+            if len(values) != len(data_rows):
+                raise ValueError(f"values has {len(values)} item(s) but the table has {len(data_rows)} data row(s)")
+            fill = list(values)
+        else:
+            fill = [value] * len(data_rows)
+        ws.cell(1, target_col, header)
+        for r, v in zip(data_rows, fill):
+            ws.cell(r, target_col, coerce_number(v)[0])
+        wb.save(path)
+        return f"created {column.upper()} ({header}) and wrote {len(data_rows)} value(s) in {sheet}"
+    finally:
+        wb.close()
+
+
 def append_rows(path: Path, sheet: str, rows: list[list]) -> str:
     """Append rows after the last used row of an EXISTING sheet; nothing already there changes."""
     if not isinstance(rows, list) or not rows or any(not isinstance(r, list) for r in rows):

@@ -50,7 +50,7 @@ WORKER_TOOLS = {
     "sheet": ["list_dir", "path_info", "read_text", "read_pdf_text",
               "xlsx_info", "xlsx_read", "xlsx_import_csv", "xlsx_query", "xlsx_aggregate",
               "xlsx_write", "xlsx_group_summary", "xlsx_append_rows", "xlsx_set_cells",
-              "xlsx_update_row", "xlsx_add_formula_column"],
+              "xlsx_update_row", "xlsx_add_formula_column", "xlsx_filter_to_sheet", "xlsx_add_column"],
 }
 
 
@@ -108,6 +108,8 @@ def model(role: str, temperature: float | None = None) -> ChatOpenAI:
     cap = os.getenv(f"{role.upper()}_MAX_TOKENS", "3000" if role == "planner" else "")
     if cap.strip():
         kwargs["max_tokens"] = int(cap)
+    if os.getenv("LLM_SEED", "").strip():   # eval sets one seed per run so pass^k uses independent samples
+        kwargs["seed"] = int(os.environ["LLM_SEED"])
     # Current Ollama versions expose Qwen3's thinking switch most reliably on
     # the native /api/chat endpoint. Its /v1 compatibility behavior has varied;
     # use the OpenAI-compatible reasoning_effort hint when configured, and keep

@@ -254,6 +254,22 @@ def xlsx_group_summary(path: str, group_by: str, column: str, op: str = "sum", t
 
 
 @mcp.tool()
+def xlsx_filter_to_sheet(path: str, target_sheet: str, where: list[dict] | None = None, order_by: str | None = None,
+                         descending: bool = False, columns: list[str] | None = None,
+                         source_sheet: str | None = None, replace_sheet: bool = True) -> str:
+    """Filter / sort / project a table AND write the result as a sheet in one call (header + matching rows)."""
+    return sheet_tools.filter_to_sheet(_xlsx(path), source_sheet, target_sheet, where, order_by, descending,
+                                       columns, replace_sheet)
+
+
+@mcp.tool()
+def xlsx_add_column(path: str, sheet: str, column: str, header: str, value=None, values: list | None = None,
+                    first_data_row: int = 2, last_data_row: int | None = None) -> str:
+    """Add a column: header in row 1, then one constant `value` for every data row, or a `values` list."""
+    return sheet_tools.add_column(_xlsx(path), sheet, column, header, value, values, first_data_row, last_data_row)
+
+
+@mcp.tool()
 def xlsx_append_rows(path: str, sheet: str, rows: list[list]) -> str:
     """Append rows below the last used row of an existing sheet. Existing cells are never changed."""
     return sheet_tools.append_rows(_p(path), sheet, rows)
