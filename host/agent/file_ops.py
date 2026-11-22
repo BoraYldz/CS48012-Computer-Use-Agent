@@ -58,19 +58,22 @@ def _new_name(name: str, prefix: str, suffix: str) -> str:
 
 async def expand_file_ops(vm, a: dict[str, Any]) -> dict[str, Any]:
     """Fill `expected_ops` / `preserved_files` from the current real state (idempotent per assertion)."""
-    op = str(a.get("op") or "move").lower()
+    prefix, suffix = a.get("rename_prefix") or "", a.get("rename_suffix") or ""
+    # `op` is normally resolved from the instruction before this point (worker_guard.resolve_file_op_intent).
+    # A null op is never guessed as "move": a wrong guess defines a wrong contract.
+    op = str(a.get("op") or ("rename" if (prefix or suffix) else "")).lower()
+    a["op"] = op or None
     src = a.get("source_dir")
     dst = a.get("destination_dir")
     ext = a.get("extension") or None
     recursive = bool(a.get("recursive"))
-    prefix, suffix = a.get("rename_prefix") or "", a.get("rename_suffix") or ""
 
     def fail(message: str) -> dict[str, Any]:
         a["expected_ops"], a["preserved_files"], a["snapshot_error"] = [], None, message
         return {"op": op, "source_dir": src, "error": message}
 
     if op not in VALID_OPS:
-        return fail(f"op must be one of {sorted(VALID_OPS)}, got {op!r}")
+        return fail(f"the planner did not say whether to move, copy or rename (op={op or None!r})")
     if not isinstance(src, str) or not src.strip():
         return fail("source_dir is required")
     if op != "rename" and (not isinstance(dst, str) or not dst.strip()):
@@ -135,7 +138,57 @@ async def snapshot_file_ops(vm, subgoal: dict[str, Any]) -> list[dict[str, Any]]
             except Exception as exc:                       # no snapshot -> UNKNOWN, never a pass
                 a["expected_ops"], a["snapshot_error"] = [], f"{type(exc).__name__}: {str(exc)[:160]}"
                 events.append({"subgoal_id": subgoal.get("id"), "error": a["snapshot_error"]})
+    _share_sibling_scope([a for a in (spec.get("checks") if isinstance(spec, dict) else None) or []
+                          if isinstance(a, dict) and a.get("kind") == "file_ops"])
     return events
+
+
+def contract_pairs(assertions: list[dict[str, Any]]) -> dict[str, set[tuple[str, str]]]:
+    """Allowed (src, dst) pairs per tool family, from the expanded file_ops contracts of a subgoal."""
+    pairs: dict[str, set[tuple[str, str]]] = {"move": set(), "copy": set()}
+    for a in assertions:
+        if isinstance(a, dict) and a.get("kind") == "file_ops" and a.get("expected_ops"):
+            for o in a["expected_ops"]:
+                pairs["copy" if o["op"] == "copy" else "move"].add((o["src"], o["dst"]))
+    return pairs
+
+
+def call_pairs(tool: str, args: dict[str, Any]) -> tuple[str, list[tuple[str, str]]] | None:
+    """The (src, dst) pairs a mutating tool call would perform, or None for other tools."""
+    try:
+        if tool in {"move_path", "copy_path"}:
+            return ("copy" if tool == "copy_path" else "move"), [(_n(args["src"]), _n(args["dst"]))]
+        if tool in {"move_files", "copy_files"}:
+            s, d = _n(args["src_dir"]), _n(args["dst_dir"])
+            return ("copy" if tool == "copy_files" else "move"), [(f"{s}/{f}", f"{d}/{f}") for f in args["filenames"]]
+    except (KeyError, TypeError):
+        return ("copy" if "copy" in tool else "move"), []
+    return None
+
+
+def violation(tool: str, args: dict[str, Any], pairs: dict[str, set[tuple[str, str]]]) -> list[tuple[str, str]]:
+    """Pairs of this call that are NOT part of the planned operations (empty list = allowed)."""
+    parsed = call_pairs(tool, args)
+    if parsed is None:
+        return []
+    family, requested = parsed
+    if not requested:
+        return [("?", "?")]
+    return [p for p in requested if p not in pairs[family]]
+
+
+def _share_sibling_scope(assertions: list[dict[str, Any]]) -> None:
+    """Several file_ops in ONE subgoal (e.g. one per extension, same destination) share scope: another
+    assertion's sources and destinations are neither 'preserved' nor 'unexpected' for this one."""
+    mine = [a for a in assertions if isinstance(a.get("expected_ops"), list) and a["expected_ops"]
+            and isinstance(a.get("preserved_files"), list)]
+    if len(mine) < 2:
+        return
+    touched = {a_id: {p for o in a["expected_ops"] for p in (o["src"], o["dst"])} for a_id, a in enumerate(mine)}
+    union = set().union(*touched.values())
+    for a_id, a in enumerate(mine):
+        a["allowed_paths"] = sorted(union - touched[a_id])
+        a["preserved_files"] = [k for k in a["preserved_files"] if _n(k.get("path")) not in union]
 
 
 def describe_ops(a: dict[str, Any]) -> str:
@@ -200,7 +253,7 @@ async def check_file_ops(vm, a: dict[str, Any]) -> tuple[str, str]:
         elif kept.get("sha256") and cur.get("sha256") != kept["sha256"]:
             altered.append(kept.get("path"))
     known = {_n(k.get("path")) for k in a.get("preserved_files") or []}
-    known |= {o["src"] for o in ops} | {o["dst"] for o in ops}
+    known |= {o["src"] for o in ops} | {o["dst"] for o in ops} | {_n(p) for p in a.get("allowed_paths") or []}
     unexpected = [p for p in now if p not in known]
 
     parts = []

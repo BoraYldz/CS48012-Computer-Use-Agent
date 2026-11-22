@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from .checkers import CheckSpec, check_spec
 from .contracts import deletion_contracts, delete_allowed, describe, snapshot_deletion_contracts
-from .file_ops import describe_ops, snapshot_file_ops
+from .file_ops import contract_pairs, describe_ops, snapshot_file_ops, violation
 from .planning import apply_plan_path_rules
 from .plan_validation import (
     add_empty_directory_postcondition,
@@ -42,9 +42,9 @@ from .runtime import (AGENT_SCOPE, MAX_QUICK_FIXES, MAX_TOKENS,
 from .sheet_contracts import snapshot_sheet_contract, workbook_overview
 from .state import AgentState
 from .tool_output import serialize_tool_result
-from .worker_guard import (LoopDetected, LoopGuard, drop_in_place_move_checks,
+from .worker_guard import (LoopDetected, LoopGuard, drop_discovery_subgoals, drop_in_place_move_checks,
                            drop_unrequested_empty_checks, policy_blocked,
-                           prune_files_assertions, select_worker_tools, wrap_untrusted)
+                           prune_files_assertions, resolve_file_op_intent, select_worker_tools, wrap_untrusted)
 
 if AGENT_SCOPE == "workspace":
     PLANNER_ROOT_GUIDANCE = """The allowed root is a user-selected local workspace directory, not the user's home folder.
@@ -277,6 +277,36 @@ class _WorkerTraceHandler(BaseCallbackHandler):
         self._safe_log("step", **record)
 
 
+def _contract_bound(tool, pairs, vm, assertions):
+    """Least privilege for file_ops subgoals: a move/copy call may only perform planned (src -> dst) pairs.
+
+    Refusals name the exact calls still needed, so a small model can self-correct (e.g. it may not move
+    a whole folder when the plan lists the individual files).
+    """
+    from langchain_core.tools import StructuredTool
+
+    async def guarded(**kwargs) -> str:
+        bad = violation(tool.name, kwargs, pairs)
+        if bad:
+            pending = []
+            for a in assertions:
+                for o in a.get("expected_ops") or []:
+                    try:
+                        info = await vm.call("path_info", path=o["dst"])
+                    except Exception:
+                        info = {}
+                    if not (isinstance(info, dict) and info.get("exists")):
+                        pending.append(f"{o['op']} {o['src']} -> {o['dst']}")
+            return (f"TOOL_ERROR [{tool.name}]: not part of the planned operations (offending: {bad[:3]}). "
+                    "Only these operations are allowed, one path pair at a time (never whole folders): "
+                    + "; ".join(pending[:10]) + (f" (+{len(pending) - 10} more)" if len(pending) > 10 else ""))
+        out = await tool.ainvoke(kwargs)
+        return out if isinstance(out, str) else _text(out)
+
+    return StructuredTool.from_function(coroutine=guarded, name=tool.name, description=tool.description,
+                                        args_schema=tool.args_schema)
+
+
 def _untrusted_reader(tool):
     """Files worker only: present file text to the model as marked, untrusted data."""
     from langchain_core.tools import StructuredTool
@@ -292,7 +322,7 @@ def _untrusted_reader(tool):
 
 async def _invoke_planner_with_diagnostics(llm, goal: str, log: RunLog):
     """Invoke the planner with visible heartbeats and a configurable hard timeout."""
-    timeout_seconds = max(30.0, float(os.getenv("PLANNER_TIMEOUT_SECONDS", "420")))
+    timeout_seconds = max(30.0, float(os.getenv("PLANNER_TIMEOUT_SECONDS", "240")))
     heartbeat_seconds = max(5.0, float(os.getenv("PLANNER_HEARTBEAT_SECONDS", "30")))
     started = time.monotonic()
     task = asyncio.create_task(
@@ -369,9 +399,23 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
                 reason="explicit source, output folder, extension mappings, and empty-source requirement",
             )
         else:
-            llm = model("planner").with_structured_output(Plan, include_raw=True)
-            out = await _invoke_planner_with_diagnostics(llm, state["goal"], log)
-            parsed: Plan | None = out["parsed"]
+            out, parsed = None, None
+            for attempt in (1, 2):
+                # Attempt 2 perturbs sampling: a deterministic runaway/invalid generation would repeat at the same temperature.
+                llm = (model("planner") if attempt == 1 else model("planner", temperature=0.4)
+                       ).with_structured_output(Plan, include_raw=True)
+                try:
+                    out = await _invoke_planner_with_diagnostics(llm, state["goal"], log)
+                    parsed = out["parsed"]
+                except Exception as exc:
+                    if attempt == 2:
+                        raise
+                    log.write("planner_retry", attempt=attempt, reason=f"{type(exc).__name__}: {str(exc)[:160]}")
+                    continue
+                if parsed is not None and parsed.subgoals:
+                    break
+                if attempt == 1:
+                    log.write("planner_retry", attempt=attempt, reason="no valid plan parsed")
             # Validate the planner's output before granting any worker access.
             if parsed is None or not parsed.subgoals:
                 raise ValueError(f"planner returned no valid plan: {out.get('parsing_error')}")
@@ -384,7 +428,9 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
             # user never asked for, drop invalid in-place move contracts.
             for event, fn in (("plan_assertion_pruning", lambda: prune_files_assertions(subgoals)),
                               ("plan_provenance_filter", lambda: drop_unrequested_empty_checks(state["goal"], subgoals)),
-                              ("plan_in_place_move_filter", lambda: drop_in_place_move_checks(subgoals))):
+                              ("plan_in_place_move_filter", lambda: drop_in_place_move_checks(subgoals)),
+                              ("plan_discovery_filter", lambda: drop_discovery_subgoals(subgoals)),
+                              ("plan_op_resolution", lambda: resolve_file_op_intent(subgoals))):
                 changed = fn()
                 if changed:
                     log.write(event, changes=changed)
@@ -581,6 +627,14 @@ def build_graph(vm: ToolBackend, log: RunLog, plan_override: list[dict] | None =
                           reason="deletion was not requested by the goal or the subgoal")
             if cap == "files":
                 worker_tools = [_untrusted_reader(t) if t.name in {"read_text", "read_pdf_text"} else t
+                                for t in worker_tools]
+            file_ops_checks = [a for a in (sg.get("check_spec") or {}).get("checks", [])
+                               if isinstance(a, dict) and a.get("kind") == "file_ops"]
+            legacy_moves = [a for a in (sg.get("check_spec") or {}).get("checks", [])
+                            if isinstance(a, dict) and a.get("kind") == "files_moved_by_extension"]
+            if cap == "files" and file_ops_checks and not legacy_moves and any(a.get("expected_ops") for a in file_ops_checks):
+                worker_tools = [_contract_bound(t, contract_pairs(file_ops_checks), vm, file_ops_checks)
+                                if t.name in {"move_path", "move_files", "copy_path", "copy_files"} else t
                                 for t in worker_tools]
             if use_bound:
                 # Bind the source and destination to the normalized check_spec.

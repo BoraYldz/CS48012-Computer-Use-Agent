@@ -31,12 +31,12 @@ FILES_KIND_FIELDS: dict[str, set[str]] = {
                                  "expected_files", "snapshot_error"},
     "no_files_by_extension": {"path", "extension", "recursive", "preserved_files"},
     "file_ops": {"op", "source_dir", "destination_dir", "extension", "recursive", "rename_prefix",
-                 "rename_suffix", "expected_ops", "preserved_files", "snapshot_error"},
+                 "rename_suffix", "expected_ops", "preserved_files", "snapshot_error", "allowed_paths"},
     "text_contains": {"path", "text"},
     "text_equals": {"path", "text"},
     "file_content_matches": {"path", "source_path"},
 }
-ORCHESTRATOR_FIELDS = {"expected_files", "snapshot_error", "preserved_files", "preserved_sheets", "expected_ops"}
+ORCHESTRATOR_FIELDS = {"expected_files", "snapshot_error", "preserved_files", "preserved_sheets", "expected_ops", "allowed_paths"}
 
 
 def _checks(subgoal: dict[str, Any]) -> list:
@@ -124,6 +124,79 @@ def drop_in_place_move_checks(subgoals: list[dict[str, Any]]) -> list[dict[str, 
                 continue
             kept.append(a)
         sg["check_spec"]["checks"] = kept
+    return changes
+
+
+_DISCOVERY = re.compile(r"^\s*(list|discover|find|inspect|identify|enumerate|scan|locate|check|look)\b", re.IGNORECASE)
+
+
+def drop_discovery_subgoals(subgoals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove read-only discovery subgoals that precede a file_ops subgoal (the contract does the discovery)."""
+    changes: list[dict[str, Any]] = []
+    keep: list[dict[str, Any]] = []
+    for i, sg in enumerate(subgoals):
+        later_ops = any(c.get("kind") == "file_ops" for later in subgoals[i + 1:]
+                        if later.get("capability") == "files" for c in _checks(later) if isinstance(c, dict))
+        kinds = {c.get("kind") for c in _checks(sg) if isinstance(c, dict)}
+        if (sg.get("capability") == "files" and later_ops and _DISCOVERY.match(sg.get("instruction", ""))
+                and kinds <= {"directory_contains_files", "path_exists"}):
+            changes.append({"subgoal_id": str(sg.get("id", "?")), "action": "dropped_discovery_only_subgoal",
+                            "instruction": str(sg.get("instruction", ""))[:120]})
+            continue
+        keep.append(sg)
+    if changes:
+        subgoals[:] = keep
+        for new_id, sg in enumerate(subgoals):
+            sg["id"] = new_id
+    return changes
+
+
+_VERB_OP = {
+    "copy": "copy", "duplicate": "copy", "backup": "copy", "clone": "copy",
+    "move": "move", "relocate": "move", "transfer": "move", "sort": "move", "collect": "move",
+    "gather": "move", "organize": "move", "organise": "move", "archive": "move",
+    "rename": "rename",
+}
+
+
+def instruction_op(instruction: str) -> str | None:
+    """Operation named by the FIRST word of the planner's own subgoal instruction ("Copy ...", "Move ...")."""
+    words = re.findall(r"[A-Za-z]+", instruction or "")
+    if not words:
+        return None
+    first = words[0].lower()
+    if first == "back" and len(words) > 1 and words[1].lower() == "up":
+        return "copy"
+    return _VERB_OP.get(first)
+
+
+def resolve_file_op_intent(subgoals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Make `op` agree with the subgoal instruction written by the same planner.
+
+    A small planner leaves `op` null or contradicts its own instruction ("Copy X" with op=move). A wrong op
+    is dangerous because it defines the contract: it would verify (and later enforce) the wrong operation.
+    A null op with no instruction verb stays null and becomes UNKNOWN downstream instead of a guess.
+    """
+    changes: list[dict[str, Any]] = []
+    for sg in subgoals:
+        if sg.get("capability") != "files":
+            continue
+        verb_op = instruction_op(sg.get("instruction", ""))
+        for a in _checks(sg):
+            if not (isinstance(a, dict) and a.get("kind") == "file_ops"):
+                continue
+            has_rename_params = bool(a.get("rename_prefix") or a.get("rename_suffix"))
+            planned = (a.get("op") or "").lower() or None
+            if has_rename_params:
+                wanted = "rename"
+            elif verb_op and verb_op != "rename":
+                wanted = verb_op
+            else:
+                wanted = planned
+            if wanted != planned:
+                changes.append({"subgoal_id": str(sg.get("id", "?")), "planner_op": planned, "resolved_op": wanted,
+                                "action": "resolved_file_ops_intent"})
+                a["op"] = wanted
     return changes
 
 

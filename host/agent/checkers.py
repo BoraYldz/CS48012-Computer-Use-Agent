@@ -54,6 +54,7 @@ class CheckAssertion(BaseModel):
     rename_prefix: str | None = None
     rename_suffix: str | None = None
     expected_ops: list[dict[str, Any]] | None = None  # orchestrator-filled from the real files
+    allowed_paths: list[str] | None = None  # orchestrator-filled: paths sibling file_ops legitimately touch
 
 
 class CheckSpec(BaseModel):

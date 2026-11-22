@@ -91,16 +91,23 @@ class ToolBackend(Protocol):
     async def call(self, name: str, **args): ...
 
 
-def model(role: str) -> ChatOpenAI:
-    """Build a role-specific model client for any OpenAI-compatible endpoint."""
+def model(role: str, temperature: float | None = None) -> ChatOpenAI:
+    """Build a role-specific model client for any OpenAI-compatible endpoint.
+
+    The planner has a completion cap (PLANNER_MAX_TOKENS, default 3000): a plan is ~1-2k tokens, so a
+    runaway generation is cut off and retried instead of hanging for minutes.
+    """
     name = os.getenv(f"{role.upper()}_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b"))
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
     kwargs = {
         "model": name,
         "base_url": base_url,
         "api_key": os.getenv("LLM_API_KEY", "ollama"),
-        "temperature": float(os.getenv("LLM_TEMPERATURE", "0")),
+        "temperature": float(os.getenv("LLM_TEMPERATURE", "0")) if temperature is None else temperature,
     }
+    cap = os.getenv(f"{role.upper()}_MAX_TOKENS", "3000" if role == "planner" else "")
+    if cap.strip():
+        kwargs["max_tokens"] = int(cap)
     # Current Ollama versions expose Qwen3's thinking switch most reliably on
     # the native /api/chat endpoint. Its /v1 compatibility behavior has varied;
     # use the OpenAI-compatible reasoning_effort hint when configured, and keep

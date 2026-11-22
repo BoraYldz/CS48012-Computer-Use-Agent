@@ -6,9 +6,11 @@ import unittest
 from pathlib import Path
 
 from agent.checkers import check_spec
-from agent.file_ops import check_file_ops, describe_ops, expand_file_ops, snapshot_file_ops
+from agent.file_ops import (check_file_ops, contract_pairs, describe_ops, expand_file_ops, snapshot_file_ops,
+                            violation)
 from agent.local_runtime import LocalVM
-from agent.worker_guard import prune_files_assertions
+from agent.worker_guard import (drop_discovery_subgoals, instruction_op, prune_files_assertions,
+                                resolve_file_op_intent)
 
 
 def run(coro):
@@ -234,6 +236,154 @@ class IntegrationTests(Base):
         self.assertIsNone(out["expected_ops"])
         self.assertNotIn("cell", out)
         self.assertEqual(out["rename_prefix"], "2026_")
+
+
+class OpInferenceTests(Base):
+    def test_null_op_with_rename_params_means_rename(self):
+        self.put("Reports/q1.txt", "1")
+        a = self.assertion(op=None, source_dir="Reports", destination_dir="Reports", extension=".txt",
+                           rename_prefix="2026_")
+        ev = run(expand_file_ops(self.vm, a))
+        self.assertEqual((a["op"], ev["count"]), ("rename", 1))
+
+    def test_null_op_is_never_guessed_as_move(self):
+        """Regression: t02 (a COPY) was contracted as a move, so the guarded tools forced the worker to move."""
+        self.put("A/x.txt", "1")
+        a = self.assertion(op=None, source_dir="A", destination_dir="B", extension=".txt")
+        run(expand_file_ops(self.vm, a))
+        self.assertIn("did not say", a["snapshot_error"])
+        self.assertEqual(self.verdict(a)[0], "unknown")
+
+
+class IntentResolutionTests(unittest.TestCase):
+    def sg(self, instruction, **a):
+        return {"id": 0, "capability": "files", "instruction": instruction,
+                "check_spec": {"checks": [{"kind": "file_ops", **a}]}}
+
+    def op_after(self, sg):
+        resolve_file_op_intent([sg])
+        return sg["check_spec"]["checks"][0]["op"]
+
+    def test_copy_instruction_overrides_wrong_move(self):
+        self.assertEqual(self.op_after(self.sg("Copy report.txt and data.csv from Docs into Backup", op="move")), "copy")
+
+    def test_null_op_takes_instruction_verb(self):
+        self.assertEqual(self.op_after(self.sg("Copy files", op=None)), "copy")
+        self.assertEqual(self.op_after(self.sg("Back up the Docs folder", op=None)), "copy")
+        self.assertEqual(self.op_after(self.sg("Move all .csv files", op=None)), "move")
+
+    def test_rename_params_win_over_everything(self):
+        self.assertEqual(self.op_after(self.sg("Move the files", op="move", rename_prefix="x_")), "rename")
+
+    def test_unknown_verb_and_null_op_stays_null(self):
+        self.assertIsNone(self.op_after(self.sg("Handle the files", op=None)))
+
+    def test_planner_op_kept_when_instruction_has_no_verb_signal(self):
+        self.assertEqual(self.op_after(self.sg("Please tidy the files", op="copy")), "copy")
+
+    def test_instruction_op_first_word_only(self):
+        self.assertIsNone(instruction_op("Ensure the files are copied"))
+        self.assertEqual(instruction_op("copy x"), "copy")
+
+
+class SiblingScopeTests(Base):
+    """One subgoal, one file_ops per extension, shared destination (a typical sort). Found by code review of t02's log."""
+
+    def setUp(self):
+        super().setUp()
+        self.put("In/a.txt", "a")
+        self.put("In/b.csv", "b")
+        self.put("In/keep.md", "k")
+        self.sg = {"id": 0, "check_spec": {"checks": [
+            self.assertion(op="move", source_dir="In", destination_dir="Out", extension=".txt"),
+            self.assertion(op="move", source_dir="In", destination_dir="Out", extension=".csv")]}}
+        run(snapshot_file_ops(self.vm, self.sg))
+
+    def test_correct_sort_passes_both_assertions(self):
+        self.vm.move_files("In", ["a.txt", "b.csv"], "Out")
+        for a in self.sg["check_spec"]["checks"]:
+            self.assertEqual(self.verdict(a)[0], "pass", self.verdict(a))
+
+    def test_keep_file_still_protected(self):
+        self.vm.move_files("In", ["a.txt", "b.csv", "keep.md"], "Out")
+        self.assertEqual(self.verdict(self.sg["check_spec"]["checks"][0])[0], "fail")
+
+    def test_siblings_not_preserved_for_each_other(self):
+        first = self.sg["check_spec"]["checks"][0]
+        self.assertEqual([k["path"] for k in first["preserved_files"]], ["In/keep.md"])
+        self.assertIn("In/b.csv", first["allowed_paths"])
+
+
+class ContractBoundCallTests(Base):
+    """The t04 worker moved the whole `sub1` folder; the contract-bound tools refuse that."""
+
+    def setUp(self):
+        super().setUp()
+        self.put("Mixed/a.csv", "1")
+        self.put("Mixed/sub1/b.csv", "2")
+        self.put("Mixed/sub1/deep/c.csv", "3")
+        self.a = self.assertion(op="move", source_dir="Mixed", destination_dir="Mixed/AllCSV",
+                                extension=".csv", recursive=True)
+        run(expand_file_ops(self.vm, self.a))
+        self.pairs = contract_pairs([self.a])
+
+    def test_whole_folder_move_is_refused(self):
+        self.assertTrue(violation("move_path", {"src": "Mixed/sub1", "dst": "Mixed/AllCSV/sub1"}, self.pairs))
+
+    def test_planned_file_move_is_allowed(self):
+        self.assertEqual(violation("move_path", {"src": "Mixed/sub1/b.csv", "dst": "Mixed/AllCSV/b.csv",
+                                                 "overwrite": False}, self.pairs), [])
+
+    def test_path_spelling_is_normalized(self):
+        self.assertEqual(violation("move_path", {"src": "./Mixed//sub1/b.csv", "dst": "Mixed/AllCSV/b.csv"},
+                                   self.pairs), [])
+
+    def test_move_files_batch_checked_per_pair(self):
+        ok = violation("move_files", {"src_dir": "Mixed", "filenames": ["a.csv"], "dst_dir": "Mixed/AllCSV"}, self.pairs)
+        bad = violation("move_files", {"src_dir": "Mixed", "filenames": ["a.csv", "notes.md"], "dst_dir": "Mixed/AllCSV"},
+                        self.pairs)
+        self.assertEqual(ok, [])
+        self.assertEqual(len(bad), 1)
+
+    def test_copy_tool_cannot_perform_a_move_contract_and_vice_versa(self):
+        self.assertTrue(violation("copy_path", {"src": "Mixed/a.csv", "dst": "Mixed/AllCSV/a.csv"}, self.pairs))
+
+    def test_copy_contract_allows_copy_but_refuses_move(self):
+        self.put("Docs/r.txt", "r")
+        c = self.assertion(op="copy", source_dir="Docs", destination_dir="Backup")
+        run(expand_file_ops(self.vm, c))
+        pairs = contract_pairs([c])
+        self.assertEqual(violation("copy_files", {"src_dir": "Docs", "filenames": ["r.txt"], "dst_dir": "Backup"}, pairs), [])
+        self.assertTrue(violation("move_files", {"src_dir": "Docs", "filenames": ["r.txt"], "dst_dir": "Backup"}, pairs))
+
+    def test_non_mutating_tools_and_malformed_calls(self):
+        self.assertEqual(violation("list_dir", {"path": "Mixed"}, self.pairs), [])
+        self.assertTrue(violation("move_files", {"src_dir": "Mixed", "filenames": [], "dst_dir": "x"}, self.pairs))
+        self.assertTrue(violation("move_path", {"src": "Mixed/a.csv"}, self.pairs))
+
+
+class DiscoveryFilterTests(unittest.TestCase):
+    def sg(self, i, instr, checks):
+        return {"id": i, "capability": "files", "instruction": instr, "check_spec": {"checks": checks}}
+
+    def test_t04_plan_loses_its_discovery_subgoal_and_ids_are_renumbered(self):
+        subs = [self.sg(0, "Discover all .csv files in Mixed and its subfolders",
+                        [{"kind": "directory_contains_files", "path": "Mixed", "recursive": True}]),
+                self.sg(1, "Move all discovered .csv files into Mixed/AllCSV",
+                        [{"kind": "file_ops", "op": "move", "source_dir": "Mixed", "destination_dir": "Mixed/AllCSV"}])]
+        self.assertEqual(len(drop_discovery_subgoals(subs)), 1)
+        self.assertEqual([s["id"] for s in subs], [0])
+        self.assertEqual(subs[0]["check_spec"]["checks"][0]["kind"], "file_ops")
+
+    def test_discovery_subgoal_kept_when_no_file_ops_follows(self):
+        subs = [self.sg(0, "List the files in Docs", [{"kind": "directory_contains_files", "path": "Docs"}])]
+        self.assertEqual(drop_discovery_subgoals(subs), [])
+        self.assertEqual(len(subs), 1)
+
+    def test_real_work_subgoal_is_never_dropped(self):
+        subs = [self.sg(0, "Find duplicates and delete them", [{"kind": "no_files_by_extension", "path": "D", "extension": ".tmp"}]),
+                self.sg(1, "Move x", [{"kind": "file_ops", "op": "move", "source_dir": "A", "destination_dir": "B"}])]
+        self.assertEqual(drop_discovery_subgoals(subs), [])
 
 
 if __name__ == "__main__":
