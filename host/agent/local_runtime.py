@@ -19,23 +19,25 @@ from . import sheet_tools
 from .tool_output import serialize_tool_result
 
 
+def format_tool_error(name: str, exc: Exception) -> str:
+    """Observation text for a failed tool call (shared by the direct and MCP paths)."""
+    if isinstance(exc, PermissionError):
+        # Human denial is final: do not invite the model to look for a workaround.
+        return f"TOOL_ERROR [{name}]: {str(exc)[:300]}"
+    return (
+        f"TOOL_ERROR [{name}]: {type(exc).__name__}: {str(exc)[:300]}. "
+        "The operation was not completed. Review the error and use a supported alternative."
+    )
+
+
 def _safe_tool_callable(fn, name: str):
     """Return tool errors as observations so ReAct can recover instead of crashing."""
     @wraps(fn)
     def invoke(*args, **kwargs):
         try:
-            result = fn(*args, **kwargs)
-            # OpenAI-compatible APIs expect plain-text tool observations. JSON
-            # encode structured returns instead of passing list/dict content blocks.
-            return serialize_tool_result(result)
-        except PermissionError as exc:
-            # Human denial is final: do not invite the model to look for a workaround.
-            return f"TOOL_ERROR [{name}]: {str(exc)[:300]}"
+            return serialize_tool_result(fn(*args, **kwargs))
         except Exception as exc:
-            return (
-                f"TOOL_ERROR [{name}]: {type(exc).__name__}: {str(exc)[:300]}. "
-                "The operation was not completed. Review the error and use a supported alternative."
-            )
+            return format_tool_error(name, exc)
     return invoke
 
 

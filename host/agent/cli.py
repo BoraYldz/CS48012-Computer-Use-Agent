@@ -20,6 +20,7 @@ from .graph import run_goal, summarize
 from .runtime import AGENT_MODE, AGENT_SCOPE, create_backend, RunLog, unload_models
 
 RESET = Path(__file__).resolve().parent.parent / "reset_vm.ps1"
+_open_backends: list = []
 
 
 def new_id(prefix: str) -> str:
@@ -55,7 +56,10 @@ async def _main():
         else:
             print("Local mode: no machine-wide reset. Task setup resets only its own task fixtures inside the configured allowed root.")
 
+    if a.cmd == "task" and a.id == "quickfix":
+        os.environ["LOCAL_TRANSPORT"] = "direct"     # fault injector lives in the in-process LocalVM
     vm = await create_backend().connect()
+    _open_backends.append(vm)
     if hasattr(vm, "approver"):
         vm.approver = (lambda req: True) if getattr(a, "auto_approve", False) else terminal_approver
 
@@ -66,6 +70,7 @@ async def _main():
 
     if a.cmd == "ping":
         print(f"mode: {AGENT_MODE}")
+        print("backend:", type(vm).__name__)
         if AGENT_MODE == "local":
             print(f"scope: {AGENT_SCOPE}")
             print("allowed root:", vm.root)
@@ -110,6 +115,9 @@ async def main():
     try:
         await _main()
     finally:
+        for backend in _open_backends:
+            if hasattr(backend, "aclose"):
+                await backend.aclose()
         # Ollama keeps the model in RAM for ~5 min after the last call; free it now.
         if os.getenv("UNLOAD_MODEL_ON_EXIT", "true").strip().lower() not in {"0", "false", "no"}:
             unload_models()

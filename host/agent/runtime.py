@@ -122,8 +122,14 @@ def model(role: str, temperature: float | None = None) -> ChatOpenAI:
 def create_backend():
     """Construct the configured local or MCP-backed tool server."""
     if AGENT_MODE == "local":
-        from .local_runtime import LocalVM
-        return LocalVM(LOCAL_ROOT)
+        transport = os.getenv("LOCAL_TRANSPORT", "mcp").strip().lower()   # read per call so tests can switch
+        if transport == "direct":
+            from .local_runtime import LocalVM
+            return LocalVM(LOCAL_ROOT)
+        if transport == "mcp":
+            from .mcp_local import McpLocalBackend
+            return McpLocalBackend(LOCAL_ROOT)
+        raise ValueError(f"LOCAL_TRANSPORT must be 'mcp' or 'direct', got {transport!r}")
     if AGENT_MODE == "vm":
         return VM()
     raise ValueError(f"AGENT_MODE must be 'local' or 'vm', got {AGENT_MODE!r}")
