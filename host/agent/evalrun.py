@@ -41,7 +41,7 @@ async def run_one(vm, task, k: int) -> dict:
     try:
         final = await run_goal(task.request(base), vm, RunLog(run_id), run_id)
     except Exception as exc:  # a crash is a failed run, not a failed eval
-        final = {"status": "crash", "approvals": list(vm.approval_log)}
+        final = {"status": "crash", "approvals": list(getattr(vm, "approval_log", []))}
         crashed = f"{type(exc).__name__}: {str(exc)[:200]}"
     elapsed = time.time() - t0
     status = final.get("status")
@@ -120,14 +120,14 @@ async def run_suite(vm, runs: int, only: str | None, tag: str, bound: str | None
     if not tasks:
         raise SystemExit(f"no tasks matched only={only!r} tag={tag!r}")
     config = {
-        "suite": suite, "scope": AGENT_SCOPE, "root": str(vm.root), "runs": runs,
+        "suite": suite, "scope": AGENT_SCOPE, "root": str(getattr(vm, 'root', 'VM')), "runs": runs,
         "bound_move": os.getenv("BOUND_MOVE", "off"),
         "plan_fastpath": os.getenv("PLAN_FASTPATH", "off"),
         "worker_model": os.getenv("WORKER_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b")),
         "planner_model": os.getenv("PLANNER_MODEL", os.getenv("DEFAULT_MODEL", "qwen3:8b")),
         "max_steps": {"files": max_steps("files"), "sheet": max_steps("sheet")},
     }
-    print(f"eval: {len(tasks)} task(s) x {runs} run(s) under {vm.root}/{files_suite.EVAL_ROOT}/")
+    print(f"eval: {len(tasks)} task(s) x {runs} run(s) under {getattr(vm, 'root', 'VM')}/{files_suite.EVAL_ROOT}/")
     rows: list[dict] = []
     try:
         for task in tasks:

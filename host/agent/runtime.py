@@ -3,7 +3,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import httpx
 from dotenv import load_dotenv
@@ -105,9 +105,13 @@ def model(role: str, temperature: float | None = None) -> ChatOpenAI:
         "api_key": os.getenv("LLM_API_KEY", "ollama"),
         "temperature": float(os.getenv("LLM_TEMPERATURE", "0")) if temperature is None else temperature,
     }
+    extra_body = {}
     cap = os.getenv(f"{role.upper()}_MAX_TOKENS", "3000" if role == "planner" else "")
     if cap.strip():
         kwargs["max_tokens"] = int(cap)
+        # langchain-openai sends max_tokens as "max_completion_tokens", which Ollama ignores;
+        # without this the cap never applied and a runaway plan filled the whole context.
+        extra_body["max_tokens"] = int(cap)
     if os.getenv("LLM_SEED", "").strip():   # eval sets one seed per run so pass^k uses independent samples
         kwargs["seed"] = int(os.environ["LLM_SEED"])
     # Current Ollama versions expose Qwen3's thinking switch most reliably on
@@ -115,7 +119,9 @@ def model(role: str, temperature: float | None = None) -> ChatOpenAI:
     # use the OpenAI-compatible reasoning_effort hint when configured, and keep
     # the prompts concise for worker calls as an additional practical safeguard.
     if ("11434" in base_url and os.getenv("OLLAMA_THINKING", "false").lower() in {"0", "false", "no"}):
-        kwargs["extra_body"] = {"reasoning_effort": "none"}
+        extra_body["reasoning_effort"] = "none"
+    if extra_body:
+        kwargs["extra_body"] = extra_body
     return ChatOpenAI(**kwargs)
 
 
@@ -135,12 +141,27 @@ def create_backend():
     raise ValueError(f"AGENT_MODE must be 'local' or 'vm', got {AGENT_MODE!r}")
 
 
+# VM tools that can destroy existing data, and where each keeps its target sheet name (arg, default).
+_SHEET_REPLACE_TOOLS = {"xlsx_write": ("sheet", "Sheet1"),
+                        "xlsx_group_summary": ("target_sheet", "Summary"),
+                        "xlsx_filter_to_sheet": ("target_sheet", None)}
+_OVERWRITE_TOOLS = {"move_path", "copy_path"}
+_GATED_TOOLS = set(_SHEET_REPLACE_TOOLS) | _OVERWRITE_TOOLS
+
+
 class VM:
     """Connection to the tool server inside the VM."""
 
     def __init__(self, url: str = VM_MCP_URL):
         self.client = MultiServerMCPClient({"vm": {"url": url, "transport": "streamable_http"}})
         self.tools = {}
+        # Human-approval gate, same contract as LocalVM: approver(request) -> bool; None = deny.
+        # It runs HERE on the host, because the VM's server cannot reach the person's terminal.
+        self.approver: Callable[[dict], bool] | None = None
+        self.approval_log: list[dict] = []
+        self.event_sink: Callable[..., Any] | None = None  # e.g. RunLog.write
+        # Sheets this run created itself: rebuilding its own output destroys no user data.
+        self._owned_sheets: set[tuple[str, str]] = set()
 
     async def connect(self):
         self.tools = {t.name: t for t in await self.client.get_tools()}
@@ -148,7 +169,84 @@ class VM:
 
     def for_worker(self, capability: str):
         # Older tool servers may lack newer tools (e.g. delete_path); skip rather than crash.
-        return [self.tools[n] for n in WORKER_TOOLS[capability] if n in self.tools]
+        tools = [self.tools[n] for n in WORKER_TOOLS[capability] if n in self.tools]
+        return [self._gated(t) if t.name in _GATED_TOOLS else t for t in tools]
+
+    # ---------- approval gate (worker tools only; harness/checker calls via call() are not gated) ----------
+    async def _sheet_rows(self, path: str, sheet: str) -> int:
+        """Used rows of a sheet in the VM: 0 if the workbook or sheet does not exist, -1 if unknown."""
+        info = await self.call("path_info", path=path)
+        if not (isinstance(info, dict) and info.get("exists")):
+            return 0
+        try:
+            overview = await self.call("xlsx_info", path=path)
+        except Exception:
+            return -1                      # exists but unreadable: treat as data at risk
+        for entry in (overview or {}).get("sheets", []):
+            if entry.get("name") == sheet:
+                return int(entry.get("used_rows") or 0)
+        return 0
+
+    async def _destruction(self, name: str, args: dict) -> tuple[str | None, tuple[str, str] | None]:
+        """(summary of what would be destroyed or None, sheet key this write creates fresh or None)."""
+        if name in _OVERWRITE_TOOLS:
+            if not args.get("overwrite"):
+                return None, None          # the server itself refuses to overwrite
+            info = await self.call("path_info", path=args.get("dst"))
+            if isinstance(info, dict) and info.get("exists"):
+                kind = "folder" if info.get("is_dir") else "file"
+                return f"OVERWRITE {args.get('dst')}: the existing {kind} will be destroyed", None
+            return None, None
+        sheet_arg, default = _SHEET_REPLACE_TOOLS[name]
+        path, sheet = args.get("path"), args.get(sheet_arg, default)
+        if not path or sheet is None or not args.get("replace_sheet", True):
+            return None, None
+        if (path, sheet) in self._owned_sheets:
+            return None, None
+        rows = await self._sheet_rows(path, sheet)
+        if rows == 0:
+            return None, (path, sheet)
+        what = f"its {rows} existing row(s)" if rows > 0 else "its existing contents"
+        return f"REPLACE sheet '{sheet}' in {path}: {what} will be destroyed", None
+
+    def _ask(self, tool: str, args: dict, summary: str) -> bool:
+        request = {"tool": tool, "args": args, "summary": summary}
+        try:
+            approved = bool(self.approver(request)) if self.approver else False
+        except Exception:
+            approved = False               # fail closed
+        record = {**request, "approved": approved}
+        self.approval_log.append(record)
+        if self.event_sink:
+            try:
+                self.event_sink("approval", **record)
+            except Exception:
+                pass
+        return approved
+
+    def _gated(self, tool):
+        """Wrap one VM tool so destructive calls wait for a human yes before reaching the VM."""
+        from langchain_core.tools import StructuredTool
+        vm = self
+
+        async def guarded(**kwargs):
+            try:
+                summary, fresh = await vm._destruction(tool.name, kwargs)
+            except Exception as exc:
+                summary, fresh = (f"{tool.name.upper()} {kwargs.get('path') or kwargs.get('dst')}: "
+                                  f"could not check what would be destroyed ({type(exc).__name__})"), None
+            if summary:
+                shown = {k: v for k, v in kwargs.items() if k != "rows"}
+                if not vm._ask(tool.name, shown, summary):
+                    return (f"TOOL_ERROR [{tool.name}]: DENIED: the user did not approve {tool.name}. "
+                            "Do not retry or look for another way to do this; stop and report that approval was denied.")
+            out = await tool.ainvoke(kwargs)
+            if fresh and not str(out).startswith("TOOL_ERROR"):
+                vm._owned_sheets.add(fresh)
+            return out
+
+        return StructuredTool.from_function(coroutine=guarded, name=tool.name,
+                                            description=tool.description, args_schema=tool.args_schema)
 
     async def call(self, name: str, **args):
         """Direct call (used by the harness and checkers). Returns parsed JSON when possible."""
