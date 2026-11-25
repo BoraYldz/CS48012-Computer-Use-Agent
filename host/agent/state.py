@@ -10,6 +10,7 @@ class Subgoal(TypedDict):
     capability: Capability
     instruction: str          # what the worker must do
     expected_output: str      # what "done" looks like, in words
+    check_spec: dict          # machine-checkable postconditions for this subgoal
 
 
 class Step(TypedDict):
@@ -23,6 +24,7 @@ class Step(TypedDict):
 class CheckResult(TypedDict):
     status: Literal["pass", "fail", "unknown"]
     detail: str
+    evidence: str
 
 
 class AgentState(TypedDict, total=False):
@@ -35,5 +37,13 @@ class AgentState(TypedDict, total=False):
     checks: dict[str, CheckResult]
     lessons: list[str]                               # Reflexion memory (Milestone 2)
     attempt: int
+    quick_fix_attempts: dict[str, int]          # count per subgoal, maximum 2
+    quick_fix_evidence: dict[str, str]           # evidence that triggered the latest repair
+    quick_fix_critic: dict[str, bool]             # whether the LLM critic supplied the repair
+    repair_instruction: str                     # scoped instruction for the next worker run
+    quick_fix_pending: bool
+    step_counts: dict[str, int]                 # cumulative tool calls per subgoal
     tokens_used: int
-    status: Literal["running", "done", "failed", "stopped"]
+    gui_results: dict[str, dict]                # GUI worker verdict per subgoal (status, reviewer_confirmed)
+    approvals: list[dict]                       # human-approval decisions (added after the run)
+    status: Literal["running", "done", "failed", "stopped", "unknown"]

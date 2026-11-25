@@ -4,12 +4,14 @@ langchain-mcp-adapters
 # langchain-mcp-adapters 0.3.x and vm/server.py use the mcp 1.x API (2.x renamed it)
 mcp<2
 python-dotenv
-# GUI worker (../gui_worker, Windows only). The host imports the worker directly; the worker's own
+openpyxl
+pypdf
+# GUI worker (../gui_worker, Windows only; the win32 markers keep pip working on macOS/Linux). The host imports the worker directly; the worker's own
 # standalone MCP server (gui_worker/mcp_server.py, mcp 2.x) is not used from here.
 pyautogui==0.9.54
 Pillow==13.0.0
-pywinauto==0.6.9
-pywin32==312
-comtypes==1.5.0
+pywinauto==0.6.9; sys_platform == "win32"
+pywin32==312; sys_platform == "win32"
+comtypes==1.5.0; sys_platform == "win32"
 openai==3.55.1
 google-genai==3.4.0
