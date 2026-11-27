@@ -39,6 +39,15 @@ def max_steps(capability: str) -> int:
 MAX_TOKENS = int(os.getenv("MAX_TOKENS_PER_TASK", "200000"))
 # Quick Fix is deliberately capped at two attempts per subgoal.
 MAX_QUICK_FIXES = min(2, max(0, int(os.getenv("MAX_QUICK_FIXES_PER_SUBGOAL", "2"))))
+
+def max_attempts() -> int:
+    """Reflexion trials per task (1 = off). Read per call so eval arms and tests can switch it."""
+    return min(3, max(1, int(os.getenv("MAX_ATTEMPTS", "1"))))
+
+
+def lessons_enabled() -> bool:
+    return os.getenv("REFLEXION_LESSONS", "on").strip().lower() not in {"0", "off", "false", "no"}
+
 RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
 
 # Which tools each worker may use (least privilege). Harness tools are never listed.
@@ -91,7 +100,7 @@ class ToolBackend(Protocol):
     async def call(self, name: str, **args): ...
 
 
-def model(role: str, temperature: float | None = None) -> ChatOpenAI:
+def model(role: str, temperature: float | None = None, seed_offset: int = 0) -> ChatOpenAI:
     """Build a role-specific model client for any OpenAI-compatible endpoint.
 
     The planner has a completion cap (PLANNER_MAX_TOKENS, default 3000): a plan is ~1-2k tokens, so a
@@ -113,7 +122,7 @@ def model(role: str, temperature: float | None = None) -> ChatOpenAI:
         # without this the cap never applied and a runaway plan filled the whole context.
         extra_body["max_tokens"] = int(cap)
     if os.getenv("LLM_SEED", "").strip():   # eval sets one seed per run so pass^k uses independent samples
-        kwargs["seed"] = int(os.environ["LLM_SEED"])
+        kwargs["seed"] = int(os.environ["LLM_SEED"]) + seed_offset
     # Current Ollama versions expose Qwen3's thinking switch most reliably on
     # the native /api/chat endpoint. Its /v1 compatibility behavior has varied;
     # use the OpenAI-compatible reasoning_effort hint when configured, and keep

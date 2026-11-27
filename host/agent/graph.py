@@ -4,6 +4,7 @@ Subgoals run in order. A bounded Quick Fix is allowed only after new determinist
 failure evidence; worker self-reports are never accepted as verification.
 """
 import asyncio
+import copy 
 import json
 import os
 import sys
@@ -16,7 +17,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 
-from . import gui
+from . import gui, memory
 from .checkers import CheckSpec, check_spec
 from .contracts import deletion_contracts, delete_allowed, describe, snapshot_deletion_contracts
 from .plan_gates import (PLAN_GAP_NOTE, drop_unrequested_deletion_checks, ground_free_text_checks,
@@ -40,11 +41,11 @@ from .plan_validation import (
     normalize_plan_check_specs,
     snapshot_move_assertions,
 )
-from .runtime import (AGENT_SCOPE, MAX_QUICK_FIXES, MAX_TOKENS,
-                      WORKER_TOOLS, ToolBackend, RunLog, bound_move_enabled, max_steps, model,
-                      plan_fastpath_enabled)
+from .runtime import (AGENT_MODE, AGENT_SCOPE, MAX_QUICK_FIXES, MAX_TOKENS,
+                      WORKER_TOOLS, ToolBackend, RunLog, bound_move_enabled, lessons_enabled,
+                      max_attempts, max_steps, model, plan_fastpath_enabled)
 from .sheet_contracts import snapshot_sheet_contract, workbook_overview
-from .state import AgentState
+from .state import AgentState, ResetList
 from .tool_output import serialize_tool_result
 from .worker_guard import (LoopDetected, LoopGuard, drop_discovery_subgoals, drop_in_place_move_checks,
                            drop_unrequested_empty_checks, policy_blocked,
@@ -423,8 +424,53 @@ def _gui_check(verdict: dict) -> dict:
     reason = verdict.get("summary") or f"GUI worker ended with {status}"
     return {"status": "fail", "evidence": reason, "detail": reason}
 
+def _trial_model(role: str, state: AgentState):
+    """Model client for this trial; trial 0 is built exactly as without Reflexion."""
+    attempt = state.get("attempt", 0)
+    return model(role, seed_offset=100 * attempt) if attempt else model(role)
 
-def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] | None = None):
+
+def reflect_block_reason(state: AgentState, signature: str, max_trials: int) -> str:
+    """Why this finished trial must not be retried; "" when Reflexion applies."""
+    if state.get("status") != "failed":
+        return f"status is {state.get('status')}"
+    if any(s["capability"] == "gui" for s in state["subgoals"]):
+        return "plan has a gui subgoal; screen actions cannot be rolled back"
+    sg = state["subgoals"][state["current"]]
+    key = str(sg["id"])
+    history = state.get("history", [])
+    if any(s.get("subgoal_id") == sg["id"] and "DENIED:" in str(s.get("observation", "")) for s in history):
+        return "human denied approval"
+    if policy_blocked(history, sg["id"]):
+        return "sandbox policy block"
+    result = state.get("checks", {}).get(key, {})
+    if result.get("status") != "fail" or not result.get("evidence"):
+        return "no deterministic failure evidence"
+    if key not in state.get("step_counts", {}):
+        return "no worker ran"
+    if state.get("attempt", 0) + 1 >= max_trials:
+        return "no trials left"
+    if state.get("tokens_used", 0) >= MAX_TOKENS:
+        return "token cap reached"
+    trials = state.get("trials", [])
+    if trials and trials[-1]["signature"] == signature:
+        return "same failure and same mutating calls as the previous trial"
+    return ""
+
+
+async def _start_reflexion(vm) -> str:
+    """Take the rollback point. Returns "" on success, else why Reflexion is off for this run."""
+    if AGENT_MODE != "local" or vm is None:
+        return "Reflexion needs the local tool backend"
+    try:
+        result = await vm.call("harness_snapshot")
+    except Exception as exc:
+        return f"snapshot failed: {type(exc).__name__}: {str(exc)[:200]}"
+    return "" if result.get("ok") else f"snapshot refused: {result.get('reason')}"
+
+
+def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] | None = None,
+                max_trials: int = 1):
     # Without a tool backend only the gui worker exists; gui is offered only where it can run.
     available = [*(WORKER_TOOLS if vm is not None else []), *(["gui"] if gui_available() else [])]
     if not available:
@@ -443,7 +489,7 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
             if bad:
                 raise ValueError(f"plan_override used unknown capabilities: {bad}")
             log.write("plan", source="task_fixture", subgoals=subgoals)
-            return {"subgoals": subgoals, "current": 0}
+            return {"subgoals": subgoals, "planned_subgoals": copy.deepcopy(subgoals), "current": 0}
 
         # Explicit extension-to-folder sorting with an empty-source postcondition is
         # sufficiently specified to plan deterministically. Avoid a costly LLM planner
@@ -579,7 +625,7 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
                 log.write("plan_deletion_snapshot", **snap)
 
         log.write("plan", subgoals=subgoals)
-        return {"subgoals": subgoals, "current": 0,
+        return {"subgoals": subgoals, "planned_subgoals": copy.deepcopy(subgoals), "current": 0,
                 "tokens_used": state.get("tokens_used", 0) + planner_tokens}
 
     async def gui_worker(state: AgentState, sg):
@@ -589,7 +635,8 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
         try:
             result = await asyncio.to_thread(
                 gui.run_gui_subgoal, sg["instruction"], sg["expected_output"], state["goal"],
-                state.get("lessons", []), f"{state.get('run_id', 'run')}-sg{sg['id']}", allowance)
+                [item["lesson"] for item in state.get("lessons", [])],
+                f"{state.get('run_id', 'run')}-sg{sg['id']}", allowance)
         except Exception as error:  # missing key or packages: a failed subgoal, not a crash
             result = {"status": "error", "reason": f"{type(error).__name__}: {error}"[:200]}
         steps, summary, tokens = gui.gui_findings(result, sg["id"])
@@ -707,6 +754,7 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
         if contracts:
             msg += (f"\nDeletion contract (enforced by the tool): {describe(contracts)}. "
                     "Every other file must remain untouched.")
+        msg += memory.lessons_block(state.get("lessons", []), sg["id"])
         if repair:
             msg += (f"\n\nQUICK FIX REQUEST (same run; do not expand scope): {repair}\n"
                     "Make the smallest necessary correction, then stop. The checker will verify again.")
@@ -806,7 +854,7 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
                 worker_tools = [StructuredTool.from_function(coroutine=delete_path, name="delete_path",
                                                              description=delete_path.__doc__)
                                 if t.name == "delete_path" else t for t in worker_tools]
-            agent = create_react_agent(model("worker"), worker_tools,
+            agent = create_react_agent(_trial_model("worker", state), worker_tools,
                                        prompt=worker_system_prompt)
             try:
                 res = await agent.ainvoke(
@@ -976,7 +1024,7 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
         critic_tokens = 0
         critic_used = False
         try:
-            llm = model("critic").with_structured_output(FixAdvice, include_raw=True)
+            llm = _trial_model("critic", state).with_structured_output(FixAdvice, include_raw=True)
             out = await llm.ainvoke([
                 ("system", QUICK_FIX_PROMPT),
                 ("user", json.dumps(critic_input, ensure_ascii=False, default=str)),
@@ -1000,18 +1048,72 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
                   evidence=evidence, instruction=instruction, critic_tokens=critic_tokens,
                   critic_used=critic_used, critic_fallback=not critic_used)
         total_tokens = state.get("tokens_used", 0) + critic_tokens
+        tried = state.get("quick_fix_instructions", {})
         return {"quick_fix_attempts": counts, "quick_fix_evidence": evidence_map,
                 "quick_fix_critic": critic_map,
+                "quick_fix_instructions": {**tried, key: [*tried.get(key, []), instruction]},
                 "repair_instruction": instruction, "quick_fix_pending": False,
                 "tokens_used": total_tokens,
                 "status": "stopped" if total_tokens > MAX_TOKENS else "running"}
 
     def route(state: AgentState):
         if state.get("status") in ("done", "failed", "stopped", "unknown"):
-            return END
+            return "reflect" if max_trials > 1 else END
         if state.get("quick_fix_pending"):
             return "quick_fix"
         return "worker"
+
+    async def reflect(state: AgentState):
+        """Close a trial: stop, or store a lesson, roll the root back and start over."""
+        attempt = state.get("attempt", 0)
+        status = state.get("status")
+        tokens = state.get("tokens_used", 0)
+        lessons = state.get("lessons", [])
+        signature = memory.trial_signature(state.get("checks", {}), state.get("history", []))
+        reason = reflect_block_reason(state, signature, max_trials)
+        if not reason:
+            sg = state["subgoals"][state["current"]]
+            key = str(sg["id"])
+            log.write("reflect", attempt=attempt, subgoal=sg["id"], use_lessons=lessons_enabled())
+            if lessons_enabled():
+                reflected = await memory.reflect(
+                    _trial_model("critic", state), goal=state["goal"], subgoal=sg,
+                    evidence=state["checks"][key]["evidence"], history=state.get("history", []),
+                    fix_instructions=state.get("quick_fix_instructions", {}).get(key, []),
+                    lessons=lessons, attempt=attempt)
+                tokens += reflected.tokens
+                lessons = memory.add_lesson(lessons, reflected.entry)
+                log.write("lesson", **reflected.entry, tokens=reflected.tokens, rejected=reflected.rejected)
+                if tokens >= MAX_TOKENS:
+                    reason = "token cap reached"
+        if not reason:
+            try:
+                result = await vm.call("harness_rollback", require_approval=AGENT_SCOPE == "workspace")
+            except Exception as exc:
+                result = {"ok": False, "reason": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            log.write("rollback", attempt=attempt, **result)
+            if not result.get("ok"):
+                reason = f"rollback: {result.get('reason')}"
+        trial = {"attempt": attempt, "status": status,
+                 "steps": sum(state.get("step_counts", {}).values()),
+                 "quick_fixes": sum(state.get("quick_fix_attempts", {}).values()),
+                 "tokens": tokens - sum(t["tokens"] for t in state.get("trials", [])),
+                 "signature": signature, "stop": reason}
+        log.write("trial_end", **trial)
+        closed = {"trials": [trial], "lessons": lessons, "tokens_used": tokens}
+        if reason:
+            if status != "done":
+                log.write("reflect_skipped", attempt=attempt, reason=reason)
+            return closed
+        log.write("trial_start", attempt=attempt + 1)
+        return {**closed, "attempt": attempt + 1, "status": "running", "current": 0,
+                "subgoals": copy.deepcopy(state["planned_subgoals"]),
+                "history": ResetList(), "findings": ResetList(), "checks": {}, "step_counts": {},
+                "quick_fix_attempts": {}, "quick_fix_evidence": {}, "quick_fix_critic": {},
+                "quick_fix_instructions": {}, "repair_instruction": "", "quick_fix_pending": False}
+
+    def after_reflect(state: AgentState):
+        return "worker" if state.get("status") == "running" else END
 
     g = StateGraph(AgentState)
     g.add_node("plan", plan)
@@ -1021,8 +1123,12 @@ def build_graph(vm: ToolBackend | None, log: RunLog, plan_override: list[dict] |
     g.add_edge(START, "plan")
     g.add_edge("plan", "worker")
     g.add_edge("worker", "check")
-    g.add_conditional_edges("quick_fix", route, ["quick_fix", "worker", END])
-    g.add_conditional_edges("check", route, ["quick_fix", "worker", END])
+    finish = "reflect" if max_trials > 1 else END
+    g.add_conditional_edges("quick_fix", route, ["quick_fix", "worker", finish])
+    g.add_conditional_edges("check", route, ["quick_fix", "worker", finish])
+    if max_trials > 1:
+        g.add_node("reflect", reflect)
+        g.add_conditional_edges("reflect", after_reflect, ["worker", END])
     return g.compile()
 
 
@@ -1033,22 +1139,43 @@ async def run_goal(
     run_id: str,
     plan_override: list[dict] | None = None,
 ) -> AgentState:
-    graph = build_graph(vm, log, plan_override=plan_override)
     if hasattr(vm, "approval_log"):
         vm.approval_log.clear()
         vm.event_sink = log.write          # approval decisions land in the run log
     log.write("run_start", goal=goal)
-    final = await graph.ainvoke({"run_id": run_id, "goal": goal, "history": [], "findings": [],
-                                 "checks": {}, "lessons": [], "attempt": 1,
-                                 "quick_fix_attempts": {}, "quick_fix_evidence": {},
-                                 "quick_fix_critic": {},
-                                 "repair_instruction": "", "quick_fix_pending": False,
-                                 "step_counts": {}, "gui_results": {}, "tokens_used": 0, "status": "running"})
+    trials, snapshot_taken, off_reason = max_attempts(), False, ""
+    if trials > 1:
+        off_reason = await _start_reflexion(vm)
+        if off_reason:
+            log.write("reflect_skipped", attempt=0, reason=off_reason)
+            trials = 1
+        else:
+            snapshot_taken = True
+            log.write("trial_start", attempt=0)
+    try:
+        graph = build_graph(vm, log, plan_override=plan_override, max_trials=trials)
+        final = await graph.ainvoke(
+            {"run_id": run_id, "goal": goal, "history": [], "findings": [],
+             "checks": {}, "lessons": [], "attempt": 0, "trials": [],
+             "quick_fix_attempts": {}, "quick_fix_evidence": {},
+             "quick_fix_critic": {}, "quick_fix_instructions": {},
+             "repair_instruction": "", "quick_fix_pending": False,
+             "step_counts": {}, "gui_results": {}, "tokens_used": 0, "status": "running"},
+            {"recursion_limit": 200 * trials} if trials > 1 else None)
+    finally:
+        if snapshot_taken:
+            try:
+                await vm.call("harness_discard_snapshot")
+            except Exception as exc:       # never mask the run's own outcome
+                log.write("snapshot_discard_error", error=f"{type(exc).__name__}: {str(exc)[:200]}")
     log.write("run_end", status=final.get("status"), tokens=final.get("tokens_used"))
-    return {**final, "approvals": list(getattr(vm, "approval_log", []))}
+    return {**final, "approvals": list(getattr(vm, "approval_log", [])),
+            **({"reflexion_off": off_reason} if off_reason else {})}
 
 
 def summarize(final: AgentState) -> str:
+    reflexion = ({"trials": final["trials"], "lessons": final.get("lessons")}
+                 if final.get("trials") else {})
     return json.dumps({
         "status": final.get("status"),
         "tokens": final.get("tokens_used"),
@@ -1059,4 +1186,5 @@ def summarize(final: AgentState) -> str:
         "step_counts": final.get("step_counts"),
         "approvals": final.get("approvals"),
         "findings": final.get("findings"),
+        **reflexion,
     }, indent=2, ensure_ascii=False)

@@ -15,7 +15,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from . import sheet_tools
+from . import rollback, sheet_tools
 from .tool_output import serialize_tool_result
 
 
@@ -107,6 +107,8 @@ class LocalVM:
         # Sheets this agent created itself (path, sheet): rebuilding its own output is not
         # destroying user data, so only PRE-EXISTING sheets are approval-gated.
         self._owned_sheets: set[tuple[str, str]] = set()
+        # Reflexion rollback point: (copy of the root, sheet ownership at that moment).
+        self._snapshot: tuple[rollback.Snapshot, set[tuple[str, str]]] | None = None
         self.event_sink: Callable[..., Any] | None = None  # e.g. RunLog.write
         self._functions = {
             "list_dir": self.list_dir,
@@ -137,6 +139,9 @@ class LocalVM:
             "harness_put_file": self.harness_put_file,
             "harness_get_file": self.harness_get_file,
             "harness_remove_path": self.harness_remove_path,
+            "harness_snapshot": self.harness_snapshot,
+            "harness_rollback": self.harness_rollback,
+            "harness_discard_snapshot": self.harness_discard_snapshot,
         }
         self.tools: dict[str, Any] = {}
 
@@ -364,7 +369,7 @@ class LocalVM:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         fault = self._write_fault
-        if fault and not fault["triggered"] and p == fault["target"]:
+        if fault and fault["remaining"] and p == fault["target"]:
             fault["write_observed"] = True
         return "ok"
 
@@ -515,15 +520,58 @@ class LocalVM:
             p.unlink()
         return "ok"
 
+    def harness_snapshot(self) -> dict:
+        """HARNESS ONLY: save the allowed root so a later trial can start from the same state."""
+        self.harness_discard_snapshot()
+        try:
+            snapshot = rollback.Snapshot.take(self.root)
+        except (OSError, rollback.RollbackError) as exc:
+            return {"ok": False, "reason": str(exc)[:300]}
+        self._snapshot = (snapshot, set(self._owned_sheets))
+        return {"ok": True, **snapshot.stats()}
+
+    def harness_rollback(self, require_approval: bool = True) -> dict:
+        """HARNESS ONLY: restore the allowed root to the saved snapshot and verify it."""
+        if self._snapshot is None:
+            return {"ok": False, "reason": "no snapshot"}
+        snapshot, owned = self._snapshot
+        try:
+            diff = snapshot.diff()
+        except (OSError, rollback.RollbackError) as exc:
+            return {"ok": False, "reason": f"restore failed: {str(exc)[:300]}"}
+        if diff and require_approval:
+            try:
+                self._require_approval("rollback", diff.counts(), diff.summary(self.root))
+            except PermissionError:
+                return {"ok": False, "reason": "denied", **diff.counts()}
+        try:
+            snapshot.restore(diff)
+        except (OSError, rollback.RollbackError) as exc:
+            return {"ok": False, "reason": f"restore failed: {str(exc)[:300]}", **diff.counts()}
+        self._owned_sheets = set(owned)
+        return {"ok": True, **diff.counts()}
+
+    def harness_discard_snapshot(self) -> dict:
+        """HARNESS ONLY: delete the saved snapshot."""
+        if self._snapshot is None:
+            return {"ok": True, "discarded": False}
+        snapshot, self._snapshot = self._snapshot[0], None
+        try:
+            snapshot.discard()
+        except OSError as exc:
+            return {"ok": False, "reason": str(exc)[:300]}
+        return {"ok": True, "discarded": True}
+
     # ---------- local test-harness controls: never exposed to workers ----------
-    def arm_write_fault(self, path: str, replacement_content: str) -> None:
-        """Corrupt the next write to exactly one sandbox path (test harness only)."""
+    def arm_write_fault(self, path: str, replacement_content: str, shots: int = 1) -> None:
+        """Corrupt the next `shots` verified writes to exactly one sandbox path (test harness only)."""
         target = self._p(path)
         if not isinstance(replacement_content, str):
             raise TypeError("replacement_content must be text")
         self._write_fault = {
             "target": target,
             "replacement_content": replacement_content,
+            "remaining": shots,
             "triggered": False,
             "write_observed": False,
         }
@@ -531,7 +579,7 @@ class LocalVM:
     def apply_pending_write_fault(self) -> dict[str, str] | None:
         """Apply the armed corruption after a worker attempt, before checking."""
         fault = self._write_fault
-        if not fault or fault["triggered"] or not fault["write_observed"]:
+        if not fault or not fault["remaining"] or not fault["write_observed"]:
             return None
         # Re-resolve at application time as well, so a path replaced by a
         # symlink after arming cannot escape the sandbox.
@@ -539,9 +587,9 @@ class LocalVM:
         if not target.is_file():
             return None
         target.write_text(fault["replacement_content"], encoding="utf-8")
-        fault["triggered"] = True
+        fault.update(triggered=True, write_observed=False, remaining=fault["remaining"] - 1)
         return {
-            "kind": "one_shot_post_worker_write_corruption",
+            "kind": "post_worker_write_corruption",
             "path": target.relative_to(self.root).as_posix(),
             "replacement_content": fault["replacement_content"],
         }

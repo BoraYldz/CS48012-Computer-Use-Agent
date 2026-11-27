@@ -4,6 +4,7 @@ import importlib
 TASKS = {
     "16": "tasks.task16_folders",
     "quickfix": "tasks.task_quick_fix",
+    "reflexion": "tasks.task_reflexion",
 }
 
 

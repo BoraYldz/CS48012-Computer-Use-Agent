@@ -26,17 +26,42 @@ class CheckResult(TypedDict):
     detail: str
     evidence: str
 
+class Lesson(TypedDict):
+    attempt: int              # trial that produced it
+    subgoal_id: int
+    capability: Capability
+    lesson: str
+
+class Trial(TypedDict):
+    attempt: int              # 0-based
+    status: str
+    steps: int
+    quick_fixes: int
+    tokens: int               # includes the reflection that closed this trial
+    signature: str
+    stop: str                 # why no further trial ran; "" if one followed
+
+class ResetList(list):
+    """Returned by a node to replace an append-only field instead of extending it (new trial)."""
+
+
+def append_or_reset(old: list, new: list) -> list:
+    return list(new) if isinstance(new, ResetList) else old + new
+
 
 class AgentState(TypedDict, total=False):
     run_id: str
     goal: str                                        # user request, never edited
     subgoals: list[Subgoal]
+    planned_subgoals: list[Subgoal]                  # frozen copy of the plan, restored each trial
     current: int                                     # index of the next subgoal
-    history: Annotated[list[Step], operator.add]     # append-only
-    findings: Annotated[list[str], operator.add]     # worker summaries, append-only
+    history: Annotated[list[Step], append_or_reset]
+    findings: Annotated[list[str], append_or_reset]  # worker summaries
     checks: dict[str, CheckResult]
-    lessons: list[str]                               # Reflexion memory (Milestone 2)
-    attempt: int
+    lessons: list[Lesson]                            # Reflexion memory, one run only
+    attempt: int                                     # trial index, 0-based
+    trials: Annotated[list[Trial], operator.add]
+    quick_fix_instructions: dict[str, list[str]]     # per subgoal, this trial
     quick_fix_attempts: dict[str, int]          # count per subgoal, maximum 2
     quick_fix_evidence: dict[str, str]           # evidence that triggered the latest repair
     quick_fix_critic: dict[str, bool]             # whether the LLM critic supplied the repair

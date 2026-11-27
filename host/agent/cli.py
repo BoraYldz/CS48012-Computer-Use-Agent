@@ -3,6 +3,8 @@
     python -m agent.cli ping                 # check the configured local or VM backend
     python -m agent.cli run "your request"   # free-form request inside the sandbox
     python -m agent.cli task 16 [--reset]    # task setup -> run -> deterministic check
+    python -m agent.cli task reflexion       # fault-injected Reflexion test (local mode)
+    ... --attempts 3 [--no-lessons]          # Reflexion trials for run / task / eval
     python -m agent.cli eval files --runs 3  # evaluation suite (see agent/evalrun.py)
     python -m agent.cli eval sheet --runs 3  # Excel worker suite (tasks/sheet_suite.py)
 
@@ -44,14 +46,22 @@ async def _main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping")
     r = sub.add_parser("run"); r.add_argument("request"); r.add_argument("--auto-approve", action="store_true")
-    t = sub.add_parser("task"); t.add_argument("id", help="task ID (16 or quickfix)"); t.add_argument("--reset", action="store_true")
+    t = sub.add_parser("task"); t.add_argument("id", help="task ID (16, quickfix or reflexion)"); t.add_argument("--reset", action="store_true")
     t.add_argument("--auto-approve", action="store_true")
     e = sub.add_parser("eval"); e.add_argument("suite", choices=["files", "sheet"])
     e.add_argument("--runs", type=int, default=3); e.add_argument("--only", default=None)
     e.add_argument("--tag", choices=["core", "extra", "heldout", "all"], default="core")
     e.add_argument("--bound", choices=["on", "off"], default=None, help="ablation: planner-bound move tool")
     e.add_argument("--fastpath", choices=["on", "off"], default=None, help="ablation: phrase-matching deterministic planner")
+    for p in (r, t, e):
+        p.add_argument("--attempts", type=int, choices=[1, 2, 3], default=None,
+                       help="Reflexion trials (default: MAX_ATTEMPTS, else 1)")
+        p.add_argument("--no-lessons", action="store_true", help="retry after rollback without lessons")
     a = ap.parse_args()
+    if getattr(a, "attempts", None):
+        os.environ["MAX_ATTEMPTS"] = str(a.attempts)
+    if getattr(a, "no_lessons", False):
+        os.environ["REFLEXION_LESSONS"] = "off"
 
     if a.cmd == "task" and a.reset:
         if AGENT_MODE == "vm":
@@ -59,8 +69,10 @@ async def _main():
         else:
             print("Local mode: no machine-wide reset. Task setup resets only its own task fixtures inside the configured allowed root.")
 
-    if a.cmd == "task" and a.id == "quickfix":
+    if a.cmd == "task" and a.id in {"quickfix", "reflexion"}:
         os.environ["LOCAL_TRANSPORT"] = "direct"     # fault injector lives in the in-process LocalVM
+    if a.cmd == "task" and a.id == "reflexion" and not a.attempts:
+        os.environ["MAX_ATTEMPTS"] = "3"
     try:
         vm = await create_backend().connect()
     except Exception as error:

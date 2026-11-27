@@ -25,6 +25,7 @@ HOST_DIR = Path(__file__).resolve().parent.parent
 JSON_RESULT_TOOLS = frozenset({
     "list_dir", "path_info", "move_files", "copy_files",
     "xlsx_info", "xlsx_read", "xlsx_query", "xlsx_aggregate",
+    "harness_snapshot", "harness_rollback", "harness_discard_snapshot",
 })
 
 
